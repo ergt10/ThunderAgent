@@ -609,9 +609,6 @@ class TrainerConfig(BaseConfig):
     """Collect training memory metrics every N global steps."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
-    async_rollout: bool = False
-    """Overlap next-batch generation with current-batch training (1-step weight staleness).
-    Only effective when colocate_all=False. Ignored otherwise."""
     rope_scaling: Optional[Dict[str, Any]] = None
     rope_theta: Optional[float] = None
 
