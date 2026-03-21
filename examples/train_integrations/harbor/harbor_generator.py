@@ -1,11 +1,19 @@
 import asyncio
+import os
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+import httpx
 from loguru import logger
 from uuid import uuid4
 from skyrl.train.generators.base import GeneratorInterface, GeneratorInput, GeneratorOutput, TrajectoryID
-from skyrl.train.generators.utils import get_rollout_metrics, get_response_ids_and_loss_mask_from_messages
+from skyrl.train.generators.utils import (
+    encode_messages_subset,
+    get_generation_prompt_ids,
+    get_response_ids_and_loss_mask_from_messages,
+    get_rollout_metrics,
+)
 from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
 from skyrl.backends.skyrl_train.inference_engines.base import ConversationType
 from skyrl.train.utils.rate_limiter import create_rate_limiter
@@ -35,6 +43,7 @@ class HarborAgentOutput:
     stop_reason: str
     loss_mask: List[int]
     prompt_ids: List[int]
+    rollout_logprobs: Optional[List[float]]
     trajectory_id: TrajectoryID
     summarization_count: Optional[int] = None
     num_turns: Optional[int] = None
@@ -58,7 +67,12 @@ class HarborGenerator(GeneratorInterface):
             max_seq_len: Maximum total sequence length (prompt + response). Used to truncate responses.
         """
         ie_cfg = generator_cfg.inference_engine
-        self.base_url = f"http://{ie_cfg.http_endpoint_host}:{ie_cfg.http_endpoint_port}"
+        self.base_url = getattr(
+            inference_engine_client,
+            "proxy_url",
+            f"http://{ie_cfg.http_endpoint_host}:{ie_cfg.http_endpoint_port}",
+        )
+        self._supports_program_release = getattr(inference_engine_client, "proxy_url", None) is not None
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -80,7 +94,8 @@ class HarborGenerator(GeneratorInterface):
         logger.info(
             f"HarborGenerator initialized with Harbor config. "
             f"Agent: {self._harbor_trial_config_template.get('agent', {}).get('name')}, "
-            f"Trials dir: {self._harbor_trial_config_template.get('trials_dir', 'trials')}"
+            f"Trials dir: {self._harbor_trial_config_template.get('trials_dir', 'trials')}, "
+            f"api_base: {self._harbor_trial_config_template.get('agent', {}).get('kwargs', {}).get('api_base')}"
         )
 
         # Read custom chat template
@@ -96,9 +111,265 @@ class HarborGenerator(GeneratorInterface):
         rate_limit_config = getattr(generator_cfg, "rate_limit", None)
         self._rate_limiter = create_rate_limiter(rate_limit_config)
 
-    async def generate(self, input_batch: GeneratorInput) -> GeneratorOutput:
+        # ThunderAgent program release is a separate HTTP cleanup path. Keep it
+        # on a shared client with retries so per-trial cleanup does not create a
+        # burst of short-lived connections that immediately times out.
+        self._release_endpoint = f"{self.base_url}/programs/release"
+        self._release_timeout_sec = max(1.0, float(os.getenv("THUNDERAGENT_RELEASE_TIMEOUT_SEC", "30")))
+        self._release_max_attempts = max(1, int(os.getenv("THUNDERAGENT_RELEASE_MAX_ATTEMPTS", "4")))
+        self._release_retry_backoff_sec = max(
+            0.0, float(os.getenv("THUNDERAGENT_RELEASE_RETRY_BACKOFF_SEC", "0.5"))
+        )
+        self._release_max_inflight = max(1, int(os.getenv("THUNDERAGENT_RELEASE_MAX_INFLIGHT", "64")))
+        self._release_client: Optional[httpx.AsyncClient] = None
+        self._release_semaphore: Optional[asyncio.Semaphore] = None
+
+    def _ensure_release_transport(self) -> tuple[httpx.AsyncClient, asyncio.Semaphore]:
+        if self._release_client is None:
+            self._release_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._release_timeout_sec),
+                limits=httpx.Limits(
+                    max_connections=max(64, self._release_max_inflight),
+                    max_keepalive_connections=min(self._release_max_inflight, 64),
+                ),
+            )
+        if self._release_semaphore is None:
+            self._release_semaphore = asyncio.Semaphore(self._release_max_inflight)
+        return self._release_client, self._release_semaphore
+
+    @staticmethod
+    def _should_collect_rollout_details(sampling_params: Optional[Dict[str, Any]]) -> bool:
+        if sampling_params is None:
+            return False
+        return sampling_params.get("logprobs") not in (None, False, 0)
+
+    @staticmethod
+    def _attach_trial_routing_ids(config: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        """Attach per-trial routing identifiers for Harbor -> ThunderAgent.
+
+        Harbor's LiteLLM path only forwards ``session_id`` inside ``extra_body``,
+        while ThunderAgent's intended scheduling identity is ``program_id``.
+        We keep them aligned so each Harbor trial becomes one ThunderAgent program.
+        """
+        agent_kwargs = config.setdefault("agent", {}).setdefault("kwargs", {})
+        agent_kwargs["session_id"] = session_id
+
+        llm_call_kwargs = agent_kwargs.setdefault("llm_call_kwargs", {})
+        extra_body = llm_call_kwargs.setdefault("extra_body", {})
+        extra_body["program_id"] = session_id
+        return config
+
+    async def _best_effort_release_program(self, program_id: Optional[str]) -> None:
+        if not self._supports_program_release or not program_id:
+            return
+
+        client, semaphore = self._ensure_release_transport()
+        async with semaphore:
+            for attempt in range(1, self._release_max_attempts + 1):
+                try:
+                    response = await client.post(self._release_endpoint, json={"program_id": program_id})
+                    if response.status_code == 404:
+                        return
+                    if response.status_code == 200:
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            payload = None
+                        if not isinstance(payload, dict) or payload.get("released") in (None, True, False):
+                            return
+                    body = response.text[:200].replace("\n", " ")
+                    logger.warning(
+                        f"ThunderAgent program release returned status {response.status_code} "
+                        f"for program_id={program_id}. body={body!r}"
+                    )
+                    return
+                except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as exc:
+                    if attempt >= self._release_max_attempts:
+                        logger.warning(
+                            f"Failed to release ThunderAgent program_id={program_id} "
+                            f"after {attempt} attempts ({type(exc).__name__}: {exc!r})"
+                        )
+                        return
+                    await asyncio.sleep(self._release_retry_backoff_sec * (2 ** (attempt - 1)))
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to release ThunderAgent program_id={program_id} "
+                        f"({type(exc).__name__}: {exc!r})"
+                    )
+                    return
+
+    @staticmethod
+    def _get_maybe_mapping_value(obj: Any, key: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @classmethod
+    def _extract_assistant_rollout_field(
+        cls,
+        agent_result: Any,
+        rollout_field_name: str,
+        direct_field_name: Optional[str] = None,
+    ) -> Optional[List[List[int] | List[float]]]:
+        if direct_field_name is not None:
+            direct_field_value = cls._get_maybe_mapping_value(agent_result, direct_field_name)
+            if direct_field_value is not None:
+                return direct_field_value
+
+        rollout_details = cls._get_maybe_mapping_value(agent_result, "rollout_details")
+        if not rollout_details:
+            return None
+
+        flattened_values: List[List[int] | List[float]] = []
+        for rollout_detail in rollout_details:
+            cur_rollout_field = cls._get_maybe_mapping_value(rollout_detail, rollout_field_name)
+            if not cur_rollout_field:
+                continue
+            if (
+                isinstance(cur_rollout_field, list)
+                and cur_rollout_field
+                and all(isinstance(x, list) for x in cur_rollout_field)
+            ):
+                flattened_values.extend(cur_rollout_field)
+            else:
+                flattened_values.append(cur_rollout_field)
+
+        return flattened_values or None
+
+    def _get_response_ids_and_loss_mask_from_harbor_rollout(
+        self,
+        messages: ConversationType,
+        assistant_completion_token_ids: List[List[int]],
+        assistant_logprobs: Optional[List[List[float]]],
+    ) -> tuple[List[int], List[int], Optional[List[float]]]:
+        generation_prompt_ids = get_generation_prompt_ids(
+            self.tokenizer, chat_template=self.custom_chat_template_content
+        )
+        response_ids: List[int] = []
+        loss_mask: List[int] = []
+        rollout_logprobs = None if assistant_logprobs is None else []
+        assistant_msg_idx = 0
+
+        for message_idx, cur_message in enumerate(messages):
+            cur_token_ids = encode_messages_subset(
+                [cur_message], self.tokenizer, chat_template=self.custom_chat_template_content
+            )
+            if cur_message["role"] == "user":
+                response_ids.extend(cur_token_ids)
+                loss_mask.extend([0] * len(cur_token_ids))
+                if rollout_logprobs is not None:
+                    rollout_logprobs.extend([0.0] * len(cur_token_ids))
+                continue
+
+            if cur_message["role"] != "assistant":
+                raise ValueError(f"Expected message role to be 'user' or 'assistant', got {cur_message['role']}")
+            if assistant_msg_idx >= len(assistant_completion_token_ids):
+                raise ValueError(
+                    f"Missing completion token ids for assistant message #{assistant_msg_idx + 1}. "
+                    f"Provided {len(assistant_completion_token_ids)} completion token id lists."
+                )
+            if cur_token_ids[: len(generation_prompt_ids)] != generation_prompt_ids:
+                raise ValueError(
+                    "Assistant message tokens should start with the generation prompt. "
+                    f"Expected {generation_prompt_ids}, got {cur_token_ids[:len(generation_prompt_ids)]}"
+                )
+
+            generated_token_ids = assistant_completion_token_ids[assistant_msg_idx]
+            if self.tokenizer.eos_token_id in cur_token_ids:
+                last_eos_token_index = len(cur_token_ids) - 1 - cur_token_ids[::-1].index(self.tokenizer.eos_token_id)
+                tokens_after_eos = cur_token_ids[last_eos_token_index + 1 :]
+            else:
+                tokens_after_eos = []
+
+            response_ids.extend(generation_prompt_ids)
+            response_ids.extend(generated_token_ids)
+            response_ids.extend(tokens_after_eos)
+
+            loss_mask.extend([0] * len(generation_prompt_ids))
+            loss_mask.extend([1] * len(generated_token_ids))
+            loss_mask.extend([0] * len(tokens_after_eos))
+
+            if rollout_logprobs is not None:
+                if assistant_msg_idx >= len(assistant_logprobs):
+                    raise ValueError(
+                        f"Missing logprobs for assistant message #{assistant_msg_idx + 1}. "
+                        f"Provided {len(assistant_logprobs)} logprob lists."
+                    )
+                cur_logprobs = assistant_logprobs[assistant_msg_idx]
+                if len(cur_logprobs) != len(generated_token_ids):
+                    raise ValueError(
+                        f"Logprobs count ({len(cur_logprobs)}) does not match completion token count "
+                        f"({len(generated_token_ids)}) for assistant message #{assistant_msg_idx + 1}."
+                    )
+                rollout_logprobs.extend([0.0] * len(generation_prompt_ids))
+                rollout_logprobs.extend(cur_logprobs)
+                rollout_logprobs.extend([0.0] * len(tokens_after_eos))
+
+            assistant_msg_idx += 1
+
+        return response_ids, loss_mask, rollout_logprobs
+
+    @classmethod
+    def _apply_sampling_params_to_trial_config(
+        cls,
+        config: Dict[str, Any],
+        sampling_params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if sampling_params is None:
+            return config
+
+        agent_cfg = config.setdefault("agent", {})
+        agent_kwargs = agent_cfg.setdefault("kwargs", {})
+        llm_call_kwargs = deepcopy(agent_kwargs.get("llm_call_kwargs", {}))
+        extra_body = deepcopy(llm_call_kwargs.get("extra_body", {}))
+
+        temperature = sampling_params.get("temperature")
+        if temperature is not None:
+            agent_kwargs["temperature"] = temperature
+
+        top_p = sampling_params.get("top_p")
+        if top_p is not None:
+            llm_call_kwargs["top_p"] = top_p
+
+        stop = sampling_params.get("stop")
+        if stop is not None:
+            llm_call_kwargs["stop"] = stop
+
+        max_tokens = sampling_params.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = sampling_params.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = sampling_params.get("max_generate_length")
+        if max_tokens is not None:
+            llm_call_kwargs["max_tokens"] = max_tokens
+
+        if sampling_params.get("top_k") not in (None, -1):
+            extra_body["top_k"] = sampling_params["top_k"]
+        if sampling_params.get("min_p") not in (None, 0, 0.0):
+            extra_body["min_p"] = sampling_params["min_p"]
+        if sampling_params.get("repetition_penalty") not in (None, 1, 1.0):
+            extra_body["repetition_penalty"] = sampling_params["repetition_penalty"]
+
+        if extra_body:
+            llm_call_kwargs["extra_body"] = extra_body
+        elif "extra_body" in llm_call_kwargs:
+            llm_call_kwargs.pop("extra_body")
+
+        if llm_call_kwargs:
+            agent_kwargs["llm_call_kwargs"] = llm_call_kwargs
+
+        requested_rollout_details = cls._should_collect_rollout_details(sampling_params)
+        agent_kwargs["collect_rollout_details"] = bool(
+            agent_kwargs.get("collect_rollout_details", False) or requested_rollout_details
+        )
+        return config
+
+    async def generate(self, input_batch: GeneratorInput, disable_tqdm: bool = False) -> GeneratorOutput:
         prompts = input_batch["prompts"]
         trajectory_ids = input_batch["trajectory_ids"]
+        sampling_params = input_batch.get("sampling_params")
 
         if trajectory_ids is None:
             raise ValueError("`trajectory_ids` is required in the input batch")
@@ -108,25 +379,50 @@ class HarborGenerator(GeneratorInterface):
             )
 
         all_outputs: List[HarborAgentOutput] = [None] * len(prompts)  # type: ignore[list-item]
-        progress = tqdm(
-            total=len(prompts),
-            desc="Generating Trajectories",
-            miniters=max(1, len(prompts) // 10),
-            mininterval=5,
-        )
+        progress = None
+        if not disable_tqdm:
+            progress = tqdm(
+                total=len(prompts),
+                desc="Generating Trajectories",
+                miniters=max(1, len(prompts) // 10),
+                mininterval=5,
+            )
 
         async def _worker(idx, prompt, trajectory_id):
-            result = await self.harbor_agent_loop(prompt=prompt, trajectory_id=trajectory_id)
+            try:
+                result = await self.harbor_agent_loop(
+                    prompt=prompt,
+                    trajectory_id=trajectory_id,
+                    sampling_params=sampling_params,
+                )
+            except Exception as e:
+                logger.warning(f"Trajectory {trajectory_id} failed during Harbor postprocessing: {e}")
+                result = HarborAgentOutput(
+                    response_ids=[0],
+                    reward=0,
+                    stop_reason="error",
+                    loss_mask=[0],
+                    prompt_ids=[0],
+                    rollout_logprobs=[0.0] if self._should_collect_rollout_details(sampling_params) else None,
+                    trajectory_id=trajectory_id,
+                )
             all_outputs[idx] = result
-            progress.update(1)
+            if progress is not None:
+                progress.update(1)
 
         try:
             async with asyncio.TaskGroup() as tg:
                 for idx, (prompt, trajectory_id) in enumerate(zip(prompts, trajectory_ids)):
                     tg.create_task(_worker(idx, prompt, trajectory_id))
         finally:
-            progress.close()
+            if progress is not None:
+                progress.close()
         all_outputs, rollout_metrics = self._mask_failed_instances_and_compute_metrics(all_outputs)
+        rollout_logprobs = (
+            [output.rollout_logprobs for output in all_outputs]
+            if all_outputs and all_outputs[0].rollout_logprobs is not None
+            else None
+        )
 
         generator_output: GeneratorOutput = {
             "prompt_token_ids": [output.prompt_ids for output in all_outputs],
@@ -135,7 +431,7 @@ class HarborGenerator(GeneratorInterface):
             "loss_masks": [output.loss_mask for output in all_outputs],
             "stop_reasons": [output.stop_reason for output in all_outputs],
             "rollout_metrics": rollout_metrics,
-            "rollout_logprobs": None,
+            "rollout_logprobs": rollout_logprobs,
         }
 
         return generator_output
@@ -179,6 +475,7 @@ class HarborGenerator(GeneratorInterface):
                 output.stop_reason = "error"
                 output.loss_mask = [0]
                 output.prompt_ids = [0]
+                output.rollout_logprobs = [0.0] if output.rollout_logprobs is not None else None
                 output.reward = 0
             else:
                 successful_outputs.append(output)
@@ -218,6 +515,7 @@ class HarborGenerator(GeneratorInterface):
         self,
         prompt: ConversationType,
         trajectory_id: TrajectoryID,
+        sampling_params: Optional[Dict[str, Any]] = None,
     ) -> HarborAgentOutput:
         """
         Run a single harbor agent.
@@ -230,14 +528,19 @@ class HarborGenerator(GeneratorInterface):
         successful = False
         is_context_length_error = False
         is_agent_timeout_error = False
+        collect_rollout_details = False
         for i in range(MAX_NUM_RETRIES_PER_TRIAL):
             prefix = f"Trajectory {trajectory_id} attempt {i+1}/{MAX_NUM_RETRIES_PER_TRIAL}"
             results = None
+            trial_session_id = None
             try:
                 # Create a fresh Trial each attempt so agent state is clean on retry.
                 config = deepcopy(self._harbor_trial_config_template)
                 config["task"] = {"path": prompt}
-                config["agent"]["kwargs"]["session_id"] = uuid4().hex
+                config = self._apply_sampling_params_to_trial_config(config, sampling_params)
+                trial_session_id = uuid4().hex
+                config = self._attach_trial_routing_ids(config, session_id=trial_session_id)
+                collect_rollout_details = bool(config["agent"]["kwargs"].get("collect_rollout_details", False))
                 trial_config = TrialConfig.model_validate(config)
                 trial = Trial(trial_config)
 
@@ -282,6 +585,8 @@ class HarborGenerator(GeneratorInterface):
             except Exception as e:
                 logger.warning(f"{prefix} failed: Error running trial: {e}. Results: {results}")
                 continue
+            finally:
+                await self._best_effort_release_program(trial_session_id)
 
         if not successful:
             # We make loss mask 0 so it does not contribute to model updates
@@ -296,6 +601,7 @@ class HarborGenerator(GeneratorInterface):
                 stop_reason=stop_reason,
                 loss_mask=[0],
                 prompt_ids=[0],
+                rollout_logprobs=[0.0] if collect_rollout_details else None,
                 trajectory_id=trajectory_id,
             )
 
@@ -312,10 +618,27 @@ class HarborGenerator(GeneratorInterface):
 
         # Process response messages (everything after the first message)
         response_messages = chat_history[1:]
-        assistant_logprobs = getattr(results.agent_result, "output_logprobs", None)
-        response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
-            response_messages, self.tokenizer, assistant_logprobs, chat_template=self.custom_chat_template_content
+        assistant_logprobs = self._extract_assistant_rollout_field(
+            results.agent_result, "logprobs", direct_field_name="output_logprobs"
         )
+        assistant_completion_token_ids = self._extract_assistant_rollout_field(
+            results.agent_result, "completion_token_ids"
+        )
+        if collect_rollout_details and (assistant_logprobs is None or assistant_completion_token_ids is None):
+            raise ValueError(
+                f"Harbor trial for trajectory {trajectory_id} did not return assistant logprobs/token ids "
+                "despite collect_rollout_details=True."
+            )
+        if assistant_completion_token_ids is not None:
+            response_ids, loss_mask, rollout_logprobs = self._get_response_ids_and_loss_mask_from_harbor_rollout(
+                response_messages,
+                assistant_completion_token_ids=assistant_completion_token_ids,
+                assistant_logprobs=assistant_logprobs,
+            )
+        else:
+            response_ids, loss_mask, rollout_logprobs = get_response_ids_and_loss_mask_from_messages(
+                response_messages, self.tokenizer, assistant_logprobs, chat_template=self.custom_chat_template_content
+            )
 
         # Determine stop reason
         max_response_tokens = max(0, self.max_seq_len - initial_prompt_length)
@@ -335,6 +658,8 @@ class HarborGenerator(GeneratorInterface):
         # from Harbor first. We do it anyway to be safe.
         response_ids = response_ids[:max_response_tokens]
         loss_mask = loss_mask[:max_response_tokens]
+        if rollout_logprobs is not None:
+            rollout_logprobs = rollout_logprobs[:max_response_tokens]
 
         return HarborAgentOutput(
             response_ids=response_ids,
@@ -342,6 +667,7 @@ class HarborGenerator(GeneratorInterface):
             stop_reason=stop_reason,
             loss_mask=loss_mask,
             prompt_ids=prompt_ids,
+            rollout_logprobs=rollout_logprobs,
             trajectory_id=trajectory_id,
             summarization_count=summarization_count,
             num_turns=num_turns,

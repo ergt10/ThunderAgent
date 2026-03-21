@@ -8,7 +8,7 @@ import ray
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from skyrl.train.entrypoints.main_base import BasePPOExp
 from skyrl.train.config import SkyRLTrainConfig, GeneratorConfig, get_config_as_yaml_str
@@ -46,6 +46,8 @@ class HarborSkyRLConfig(SkyRLTrainConfig):
 
     harbor_trial_config: Dict[str, Any] = field(default_factory=dict)
     generator: HarborGeneratorConfig = field(default_factory=HarborGeneratorConfig)
+    max_train_tasks: Optional[int] = None
+    max_eval_tasks: Optional[int] = None
 
 
 class HarborExp(BasePPOExp):
@@ -69,6 +71,7 @@ class HarborExp(BasePPOExp):
         """
         prompts_dataset = HarborTaskDataset(
             data_files=self.cfg.data.train_data,
+            max_tasks=self.cfg.max_train_tasks,
         )
         assert (
             len(prompts_dataset) >= self.cfg.trainer.train_batch_size
@@ -84,6 +87,7 @@ class HarborExp(BasePPOExp):
         if self.cfg.trainer.eval_interval > 0 and self.cfg.data.val_data:
             prompts_dataset = HarborTaskDataset(
                 data_files=self.cfg.data.val_data,
+                max_tasks=self.cfg.max_eval_tasks,
             )
             return prompts_dataset
         return None

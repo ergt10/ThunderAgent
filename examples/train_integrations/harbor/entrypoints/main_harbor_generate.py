@@ -22,10 +22,6 @@ from .main_harbor import (
 )
 
 
-# For debugging purposes, we only generate a few samples.
-NUM_SAMPLES_TO_TEST = 10
-
-
 class HarborGenerateExp(BasePPOExp):
     def get_generator(self, cfg, tokenizer, inference_engine_client):
         """
@@ -55,11 +51,21 @@ class HarborGenerateExp(BasePPOExp):
         """
         prompts_dataset = HarborTaskDataset(
             data_files=self.cfg.data.train_data,
+            max_tasks=self.cfg.max_train_tasks,
         )
         assert (
             len(prompts_dataset) >= self.cfg.trainer.train_batch_size
         ), f"dataset should be atleast as large as `train_batch_size` {self.cfg.trainer.train_batch_size}, got size {len(prompts_dataset)}"
         return prompts_dataset
+
+    def get_eval_dataset(self):
+        """Initializes the evaluation dataset."""
+        if self.cfg.trainer.eval_interval > 0 and self.cfg.data.val_data:
+            return HarborTaskDataset(
+                data_files=self.cfg.data.val_data,
+                max_tasks=self.cfg.max_eval_tasks,
+            )
+        return None
 
     def run(self):
         generator = self._setup_generator()
@@ -70,10 +76,10 @@ class HarborGenerateExp(BasePPOExp):
             prompts.append(item["prompt"])
             trajectory_ids.append(TrajectoryID(instance_id=item["uid"], repetition_id=0))
 
-        # Build input from the training dataset
+        # Build input from the configured training subset.
         input_batch = GeneratorInput(
-            prompts=prompts[:NUM_SAMPLES_TO_TEST],
-            trajectory_ids=trajectory_ids[:NUM_SAMPLES_TO_TEST],
+            prompts=prompts,
+            trajectory_ids=trajectory_ids,
             env_classes=None,
             env_extras=None,
             sampling_params=None,

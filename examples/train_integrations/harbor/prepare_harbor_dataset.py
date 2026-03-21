@@ -110,7 +110,11 @@ def prepare(dataset_name: str, output_dir: str | None = None) -> str:
     repo_name = dataset_name.split("/")[-1] if "/" in dataset_name else dataset_name
     if output_dir is None:
         output_dir = os.path.join("~/data/harbor", repo_name)
-    output_path = Path(os.path.expanduser(output_dir)).resolve()
+    # Keep the user-provided output path stable instead of resolving symlinks.
+    # For directory-style datasets, we may intentionally replace this path with
+    # a symlink to the HF snapshot. Calling `.resolve()` here would follow an
+    # existing symlink and can turn a re-run into a self-referential symlink.
+    output_path = Path(os.path.expanduser(output_dir))
 
     print(f"Downloading {dataset_name}...")
     snapshot_dir = Path(snapshot_download(repo_id=dataset_name, repo_type="dataset"))

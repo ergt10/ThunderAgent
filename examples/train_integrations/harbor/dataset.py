@@ -1,5 +1,5 @@
 from loguru import logger
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 
 
@@ -12,23 +12,38 @@ class HarborTaskDataset:
     def __init__(
         self,
         data_files: List[str],
+        max_tasks: Optional[int] = None,
     ):
         """
         Initialize the HarborTaskDataset.
 
         Args:
             data_files: List of direct file/directory paths pointing to Harbor task data
+            max_tasks: If set, limit the dataset to this many tasks (for smoke/pilot runs)
         """
         self.data_files = data_files
 
         # Load all data files
         self.task_paths = self._load_data_files()
 
+        if max_tasks is not None and max_tasks < len(self.task_paths):
+            logger.info(f"HarborTaskDataset limiting to {max_tasks} tasks (out of {len(self.task_paths)} available)")
+            self.task_paths = self.task_paths[:max_tasks]
+
         logger.info(f"HarborTaskDataset initialized with {len(self.task_paths)} task paths")
+
+    @staticmethod
+    def _canonicalize_task_path(task_path: Path) -> Path:
+        return task_path.expanduser().resolve()
+
+    @classmethod
+    def _make_uid(cls, task_path: Path) -> str:
+        return str(cls._canonicalize_task_path(task_path))
 
     def _load_data_files(self) -> List[Path]:
         """Load all data files from direct paths and return list of task paths."""
         task_paths = []
+        seen_uids = set()
 
         for data_source in self.data_files:
             source_path = Path(data_source)
@@ -42,17 +57,28 @@ class HarborTaskDataset:
             # If the path is a directory, find all valid task subdirectories
             if source_path.is_dir():
                 # Look for task subdirectories and validate them
-                all_dirs = [d for d in source_path.iterdir() if d.is_dir()]
+                all_dirs = sorted(d for d in source_path.iterdir() if d.is_dir())
                 valid_task_dirs = [d for d in all_dirs if self._is_valid_task_directory(d)]
 
                 if valid_task_dirs:
-                    task_paths.extend(valid_task_dirs)
+                    for task_dir in valid_task_dirs:
+                        uid = self._make_uid(task_dir)
+                        if uid in seen_uids:
+                            logger.warning(f"Skipping duplicate Harbor task path: {task_dir}")
+                            continue
+                        task_paths.append(self._canonicalize_task_path(task_dir))
+                        seen_uids.add(uid)
                     logger.info(
                         f"Found {len(valid_task_dirs)} valid task directories out of {len(all_dirs)} total directories"
                     )
                 elif self._is_valid_task_directory(source_path):
                     # If no subdirectories but the main directory is valid, treat it as a task
-                    task_paths.append(source_path)
+                    uid = self._make_uid(source_path)
+                    if uid in seen_uids:
+                        logger.warning(f"Skipping duplicate Harbor task path: {source_path}")
+                        continue
+                    task_paths.append(self._canonicalize_task_path(source_path))
+                    seen_uids.add(uid)
                     logger.info("Using main directory as valid task")
                 else:
                     logger.warning(f"No valid task directories found in {source_path}")
@@ -78,7 +104,7 @@ class HarborTaskDataset:
             "prompt": str(self.task_paths[index]),
             "env_class": None,
             "env_extras": {"data_source": str(self.task_paths[index])},
-            "uid": str(index),
+            "uid": self._make_uid(self.task_paths[index]),
         }
 
     def __len__(self) -> int:
@@ -87,12 +113,12 @@ class HarborTaskDataset:
 
     def __iter__(self):
         """Iterate over all task paths as dictionaries."""
-        for index, task_path in enumerate(self.task_paths):
+        for task_path in self.task_paths:
             yield {
                 "prompt": str(task_path),
                 "env_class": None,
                 "env_extras": {"data_source": str(task_path)},
-                "uid": str(index),
+                "uid": self._make_uid(task_path),
             }
 
     def get_task_paths(self) -> List[Path]:
