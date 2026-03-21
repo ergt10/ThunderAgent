@@ -378,7 +378,7 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
             "for multi-turn generation"
         )
 
-    if not ie_cfg.run_engines_locally:
+    if not ie_cfg.run_engines_locally and not _SKYRL_USE_NEW_INFERENCE:
         assert ie_cfg.num_engines == len(ie_cfg.remote_urls), "num_engines should be equal to the number of remote_urls"
 
     if not ie_cfg.async_engine and ie_cfg.backend == "vllm":
@@ -405,7 +405,10 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
                 f"`logprobs` if set should be 0 or 1 (both return only the chosen token's logprob), "
                 f"got {cfg.generator.sampling_params.logprobs}"
             )
-        if not ie_cfg.run_engines_locally:
+        # Legacy remote engines do not return token-in/token-out logprobs.
+        # The new HTTP inference path can return chosen-token logprobs via
+        # RemoteInferenceClient, so only gate the legacy path here.
+        if not ie_cfg.run_engines_locally and not _SKYRL_USE_NEW_INFERENCE:
             raise NotImplementedError("Remote inference mode doesn't support `sampling_params.logprobs`")
 
     if cfg.trainer.strategy == "megatron":
@@ -588,22 +591,58 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         env_vars["NCCL_P2P_DISABLE"] = "1"
         env_vars["NCCL_SHM_DISABLE"] = "1"
 
-    # TODO: this can be removed if we standardize on env files.
-    # But it's helpful for a quickstart
-    if os.environ.get("WANDB_API_KEY"):
-        logger.info("Exporting wandb api key to ray runtime env")
-        env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
-
-    if os.environ.get("MLFLOW_TRACKING_URI"):
-        logger.info("Exporting mlflow tracking uri to ray runtime env")
-        env_vars["MLFLOW_TRACKING_URI"] = os.environ["MLFLOW_TRACKING_URI"]
-
-    if os.environ.get("MLFLOW_TRACKING_TOKEN"):
-        logger.info("Exporting mlflow tracking token to ray runtime env")
-        env_vars["MLFLOW_TRACKING_TOKEN"] = os.environ["MLFLOW_TRACKING_TOKEN"]
-
-    # NOTE(charlie): these are for Harbor. We should remove these once we have a sustainable way to handle these environment vars.
-    for var_name in ["DAYTONA_API_KEY", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]:
+    passthrough_env_vars = [
+        "WANDB_API_KEY",
+        "MLFLOW_TRACKING_URI",
+        "MLFLOW_TRACKING_TOKEN",
+        # Harbor / control-plane credentials
+        "DAYTONA_API_KEY",
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        # New inference + network topology
+        "_SKYRL_USE_NEW_INFERENCE",
+        "NCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
+        # Rootless Docker on head-pinned Harbor control plane
+        "DOCKER_HOST",
+        "XDG_RUNTIME_DIR",
+        "HARBOR_DOCKER_KEEP_IMAGES",
+        "HARBOR_DOCKER_DISABLE_PROJECT_NETWORK",
+        "HARBOR_SHARED_UV_CACHE_HOST_DIR",
+        "HARBOR_SHARED_UV_CACHE_ENV_DIR",
+        "HARBOR_SHARED_MINI_SWE_TOOL_HOST_HOME",
+        "HARBOR_SHARED_MINI_SWE_TOOL_ENV_HOME",
+        "HARBOR_SHARED_UV_PYTHON_HOST_DIR",
+        "HARBOR_SHARED_UV_PYTHON_ENV_DIR",
+        "HARBOR_MINI_SWE_AGENT_GIT_REF",
+        "HARBOR_MINI_SWE_AGENT_UV_OFFLINE",
+        # Keep caches and downloads off /home on Ray workers
+        "TMPDIR",
+        "RAY_TMPDIR",
+        "UV_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "HF_HOME",
+        "HUGGINGFACE_HUB_CACHE",
+        "HF_HUB_CACHE",
+        "HF_XET_CACHE",
+        "TRANSFORMERS_CACHE",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        # vLLM runtime/cache behavior for any Ray-side inference helpers
+        "VLLM_CACHE_ROOT",
+        "VLLM_CONFIG_ROOT",
+        "VLLM_DISABLE_COMPILE_CACHE",
+        "VLLM_USE_STANDALONE_COMPILE",
+        "VLLM_USE_V1",
+        "VLLM_ENABLE_V1_MULTIPROCESSING",
+        "AIOHTTP_CONNECTOR_LIMIT",
+        "AIOHTTP_CONNECTOR_LIMIT_PER_HOST",
+        "PYTORCH_CUDA_ALLOC_CONF",
+    ]
+    for var_name in passthrough_env_vars:
         if value := os.environ.get(var_name):
             logger.info(f"Exporting {var_name} to ray runtime env")
             env_vars[var_name] = value

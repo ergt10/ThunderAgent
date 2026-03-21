@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import math
 import os
@@ -197,52 +198,76 @@ class RayPPOTrainer:
         if self.cfg.trainer.algorithm.use_kl_in_reward:
             self.reward_kl_controller = get_kl_controller(self.cfg.trainer.algorithm)
 
+        # async rollout setup
+        async_mode = self._should_async_rollout()
+        if self.cfg.trainer.async_rollout and self.colocate_all:
+            logger.warning("async_rollout=True ignored when colocate_all=True (shared GPUs)")
+        if async_mode:
+            logger.info("Async rollout enabled: generation will overlap with training (1-step weight staleness)")
+
         # main training loop
         pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Batches Processed")
         start_epoch = self.global_step // len(self.train_dataloader)
         self.global_step += 1  # start training at global_step 1
+
+        # Prefetched generation state for async rollout.
+        # When set: (GeneratorOutput, uids, collected_metrics, GeneratorInput)
+        _prefetched = None
+
         for epoch in range(start_epoch, self.cfg.trainer.epochs):
-            for iter, rand_prompts in enumerate(self.train_dataloader):
+            dl_iter = iter(self.train_dataloader)
+            dl_len = len(self.train_dataloader)
+
+            for iter_idx in range(dl_len):
                 with Timer("step", self.all_timings):
-                    # for colocate_all=true, inference engine is always on GPU when starting the training step
+                    # --- Step 1: Generation phase ---
+                    if _prefetched is not None:
+                        # Use prefetched generation result produced during previous iteration's training
+                        generator_output, uids, prefetch_metrics, generator_input = _prefetched
+                        _prefetched = None
+                        self.all_metrics.update(prefetch_metrics)
+                    else:
+                        # No prefetch available: generate synchronously
+                        # for colocate_all=true, inference engine is always on GPU when starting the training step
+                        rand_prompts = next(dl_iter)
 
-                    # 0. truncate data to have even shards
-                    rand_prompts = self._remove_tail_data(rand_prompts)
-                    generator_input, uids = prepare_generator_input(
-                        rand_prompts,
-                        self.cfg.generator.n_samples_per_prompt,
-                        get_sampling_params_for_backend(
-                            self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
-                        ),
-                        self.cfg.environment.env_class,
-                        "train",
-                        self.global_step,
-                    )
+                        # 0. truncate data to have even shards
+                        rand_prompts = self._remove_tail_data(rand_prompts)
+                        generator_input, uids = prepare_generator_input(
+                            rand_prompts,
+                            self.cfg.generator.n_samples_per_prompt,
+                            get_sampling_params_for_backend(
+                                self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
+                            ),
+                            self.cfg.environment.env_class,
+                            "train",
+                            self.global_step,
+                        )
 
-                    # 1.1. generation phase
-                    with Timer("generate", self.all_timings):
-                        generator_output: GeneratorOutput = await self.generate(generator_input)
+                        # 1.1. generation phase
+                        with Timer("generate", self.all_timings):
+                            generator_output: GeneratorOutput = await self.generate(generator_input)
 
-                    if self.cfg.generator.step_wise_trajectories:
-                        # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
-                        # this is because in step-wise training, len(uids) != len(generator_output["response_ids"])
-                        uids = [trajectory_id.instance_id for trajectory_id in generator_output["trajectory_ids"]]
+                        if self.cfg.generator.step_wise_trajectories:
+                            # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
+                            # this is because in step-wise training, len(uids) != len(generator_output["response_ids"])
+                            uids = [trajectory_id.instance_id for trajectory_id in generator_output["trajectory_ids"]]
 
-                    # dynamic sampling
-                    if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
-                        generator_output, uids, keep_sampling = self.handle_dynamic_sampling(generator_output, uids)
-                        if keep_sampling:  # continue sampling
-                            # update progress bar for current batch (but not global step)
-                            pbar.update(1)
-                            continue
+                        # dynamic sampling
+                        if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
+                            generator_output, uids, keep_sampling = self.handle_dynamic_sampling(generator_output, uids)
+                            if keep_sampling:  # continue sampling
+                                # update progress bar for current batch (but not global step)
+                                pbar.update(1)
+                                continue
 
-                    if self.colocate_all:
-                        # if we are not continuing sampling, we sleep the inference engine
-                        await self.inference_engine_client.sleep()
+                        if self.colocate_all:
+                            # if we are not continuing sampling, we sleep the inference engine
+                            await self.inference_engine_client.sleep()
 
-                    # 1.2 postprocess rewards
-                    with Timer("postprocess_generator_output", self.all_timings):
-                        generator_output = self.postprocess_generator_output(generator_output, uids)
+                        # 1.2 postprocess rewards
+                        with Timer("postprocess_generator_output", self.all_timings):
+                            generator_output = self.postprocess_generator_output(generator_output, uids)
 
                     # 2. print example just for debugging
                     vis = self.tokenizer.decode(generator_output["response_ids"][0])
@@ -283,10 +308,46 @@ class RayPPOTrainer:
                         with Timer("dump_data_batch"):
                             self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
 
-                    # 7. train policy/critic model
-                    # Policy model is backloaded to GPU during training
-                    with Timer("train_critic_and_policy", self.all_timings):
-                        status = self.train_critic_and_policy(training_input)
+                    # 7. train policy/critic model + optional concurrent next-batch generation
+                    is_last_in_epoch = iter_idx == dl_len - 1
+                    can_prefetch = (
+                        async_mode and not is_last_in_epoch and self.cfg.trainer.algorithm.dynamic_sampling.type is None
+                    )
+
+                    if can_prefetch:
+                        # Consume next batch from dataloader for prefetch generation
+                        next_prompts = self._remove_tail_data(next(dl_iter))
+                        next_gen_input, next_uids = prepare_generator_input(
+                            next_prompts,
+                            self.cfg.generator.n_samples_per_prompt,
+                            get_sampling_params_for_backend(
+                                self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
+                            ),
+                            self.cfg.environment.env_class,
+                            "train",
+                            self.global_step + 1,
+                        )
+
+                        # Run training and next-batch generation concurrently.
+                        # asyncio.to_thread releases the event loop for generation while
+                        # training blocks on ray.get() calls in a worker thread.
+                        gen_task = asyncio.create_task(self._generate_for_prefetch(next_gen_input, next_uids))
+                        try:
+                            with Timer("train_critic_and_policy", self.all_timings):
+                                status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
+
+                            # Wait for prefetched generation to complete (may already be done)
+                            with Timer("prefetch_wait", self.all_timings):
+                                prefetched_output, prefetched_uids, prefetched_metrics = await gen_task
+
+                            _prefetched = (prefetched_output, prefetched_uids, prefetched_metrics, next_gen_input)
+                        except BaseException:
+                            gen_task.cancel()
+                            raise
+                    else:
+                        # Train synchronously (original behavior)
+                        with Timer("train_critic_and_policy", self.all_timings):
+                            status = self.train_critic_and_policy(training_input)
 
                     # 8. conditionally save checkpoints and hf model
                     if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
@@ -303,7 +364,7 @@ class RayPPOTrainer:
                     if (
                         self.cfg.trainer.update_ref_every_epoch
                         and self.ref_model is not None
-                        and iter == len(self.train_dataloader) - 1
+                        and iter_idx == dl_len - 1
                         and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
                     ):
                         with Timer("update_ref_with_policy", self.all_timings):
@@ -343,11 +404,11 @@ class RayPPOTrainer:
         pbar.close()
         if self.colocate_all:
             await self.inference_engine_client.sleep()
-        if self.cfg.trainer.ckpt_interval > 0:
+        if self.cfg.trainer.ckpt_interval > 0 and self.cfg.trainer.save_final_checkpoint_at_end:
             with Timer("save_checkpoints", self.all_timings):
                 self.save_checkpoints()
                 logger.info("Saved final checkpoint.")
-        if self.cfg.trainer.hf_save_interval > 0:
+        if self.cfg.trainer.hf_save_interval > 0 and self.cfg.trainer.save_final_hf_model_at_end:
             with Timer("save_hf_model", self.all_timings):
                 self.save_models()
                 logger.info("Saved final model.")
@@ -474,6 +535,7 @@ class RayPPOTrainer:
                 num_gpus_per_actor=0.75 if pg else 1,
                 colocate_all=False,
                 sequence_parallel_size=cfg.trainer.policy.sequence_parallel_size,
+                record_memory=cfg.trainer.policy.record_memory,
             )
             if use_ref_model:
                 ref_model = PPORayActorGroup(
@@ -698,13 +760,15 @@ class RayPPOTrainer:
 
         return generator_output
 
-    @torch.no_grad()
-    def postprocess_generator_output(self, generator_output: GeneratorOutput, uids: List[str]) -> GeneratorOutput:
-        """
-        Converts to per token rewards and computes pass@N.
+    def _should_async_rollout(self) -> bool:
+        """Check if async rollout is enabled and conditions are met."""
+        return self.cfg.trainer.async_rollout and not self.colocate_all
 
-        In the future algorithm specific reward or loss mask post processing should be done here.
-        """
+    @torch.no_grad()
+    def _postprocess_generator_output_impl(
+        self, generator_output: GeneratorOutput, uids: List[str]
+    ) -> Tuple[GeneratorOutput, Dict[str, Any]]:
+        """Core postprocessing logic. Returns (output, reward_metrics) without side effects."""
         generator_output_for_metrics = generator_output
         uids_for_metrics = uids
         if self.cfg.generator.step_wise_trajectories:
@@ -756,13 +820,53 @@ class RayPPOTrainer:
             "reward/avg_raw_reward": overall_metrics["avg_score"],
             "reward/mean_positive_reward": overall_metrics["mean_positive_reward"],
         }
-        self.all_metrics.update(reward_metrics)
         logger.info(
             f"reward/avg_pass_at_{n_samples_per_prompt}: {overall_metrics['pass_at_n']}, reward/avg_raw_reward: {overall_metrics['avg_score']}, reward/mean_positive_reward: {overall_metrics['mean_positive_reward']}"
         )
         # re-assign reward but now it's per token rewards
         generator_output["rewards"] = per_token_rewards
+        return generator_output, reward_metrics
+
+    @torch.no_grad()
+    def postprocess_generator_output(self, generator_output: GeneratorOutput, uids: List[str]) -> GeneratorOutput:
+        """
+        Converts to per token rewards and computes pass@N.
+
+        In the future algorithm specific reward or loss mask post processing should be done here.
+        """
+        generator_output, reward_metrics = self._postprocess_generator_output_impl(generator_output, uids)
+        self.all_metrics.update(reward_metrics)
         return generator_output
+
+    async def _generate_for_prefetch(
+        self,
+        generator_input: GeneratorInput,
+        uids: List[str],
+    ) -> Tuple[GeneratorOutput, List[str], Dict[str, Any]]:
+        """Generate rollouts for prefetching. Does NOT write to self.all_metrics.
+
+        Returns:
+            Tuple of (generator_output, uids, collected_metrics) with metrics deferred
+            until the prefetched result is consumed.
+        """
+        collected_metrics: Dict[str, Any] = {}
+
+        # Call generator directly (not self.generate()) to avoid writing to self.all_metrics
+        generator_output: GeneratorOutput = await self.generator.generate(generator_input)
+
+        if generator_output["rollout_metrics"] is not None:
+            collected_metrics.update(generator_output["rollout_metrics"])
+
+        if not self.cfg.generator.step_wise_trajectories:
+            validate_generator_output(len(generator_input["prompts"]), generator_output)
+
+        if self.cfg.generator.step_wise_trajectories:
+            uids = [trajectory_id.instance_id for trajectory_id in generator_output["trajectory_ids"]]
+
+        generator_output, reward_metrics = self._postprocess_generator_output_impl(generator_output, uids)
+        collected_metrics.update(reward_metrics)
+
+        return generator_output, uids, collected_metrics
 
     @torch.no_grad()
     def compute_advantages_and_returns(self, data: TrainingInputBatch) -> TrainingInputBatch:
@@ -872,6 +976,25 @@ class RayPPOTrainer:
         data_save_dir.mkdir(parents=True, exist_ok=True)
         data.save(data_save_dir / f"{file_name}.pkl")
 
+    def _collect_memory_metrics(self, phase: str) -> None:
+        """Collect training-worker memory metrics for the current step."""
+        if not self.cfg.trainer.collect_memory_metrics:
+            return
+        interval = max(1, self.cfg.trainer.collect_memory_metrics_interval)
+        if self.global_step % interval != 0:
+            return
+
+        models = ["policy"]
+        if self.ref_model is not None:
+            models.append("ref")
+        if self.has_critic:
+            models.append("critic")
+
+        for model in models:
+            memory_metrics = self.dispatch.get_memory_breakdown(model)
+            for key, value in memory_metrics.items():
+                self.all_metrics[f"memory/{phase}/{model}/{key}"] = value
+
     def pad_batch(self, training_input: TrainingInputBatch) -> TrainingInputBatch:
         """Pad the batch to be divisible by dp size"""
         import math
@@ -949,6 +1072,8 @@ class RayPPOTrainer:
         # Policy forward
         policy_output = self.dispatch.forward("policy", data_fwd_pass)
         action_log_probs = policy_output["output"]
+
+        self._collect_memory_metrics("after_logprobs")
 
         # Empty cache after all forward passes
         self.dispatch.empty_cache()
@@ -1113,6 +1238,7 @@ class RayPPOTrainer:
         for k, v in policy_status.items():
             self.all_metrics.update({f"policy/{k}": v})
 
+        self._collect_memory_metrics("after_train")
         self.dispatch.empty_cache()
 
         return policy_status

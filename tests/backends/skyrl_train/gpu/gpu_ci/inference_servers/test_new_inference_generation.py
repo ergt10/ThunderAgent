@@ -19,6 +19,8 @@ import pytest
 import asyncio
 import aiohttp
 import requests
+import threading
+import time
 from http import HTTPStatus
 from typing import Any, Dict, List, Literal
 from pydantic import BaseModel
@@ -32,6 +34,7 @@ from transformers import AutoTokenizer
 
 from litellm import acompletion as litellm_async_completion
 from litellm import atext_completion as litellm_async_text_completion
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import PauseMode
 
 MODEL_QWEN2_5 = "Qwen/Qwen2.5-0.5B-Instruct"
 SERVED_MODEL_NAME = "my_qwen"
@@ -68,6 +71,21 @@ def _get_base_url(engines: InferenceEngineState) -> str:
     """Get the router's base URL for OpenAI-compatible API (e.g. http://host:port/v1)."""
     proxy_url = engines.client.proxy_url
     return f"{proxy_url}/v1"
+
+
+def _build_abort_test_payload(stream: bool, max_tokens: int = 900) -> Dict[str, Any]:
+    return {
+        "model": SERVED_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": "You are a token generator that keeps talking endlessly."},
+            {"role": "user", "content": "Write a very long rambling response without ending."},
+        ],
+        "max_tokens": max_tokens,
+        "ignore_eos": True,
+        "temperature": 0.0,
+        "stream": stream,
+        "stream_options": {"include_usage": True} if stream else None,
+    }
 
 
 # Shared vllm server for all the tests in this file.
@@ -231,6 +249,90 @@ def test_chat_completions_streaming(vllm_server: InferenceEngineState):
                 full_content += content
     # Non-null response from API server
     assert len(full_content) > 0
+
+
+@pytest.mark.vllm
+def test_chat_completions_abort_non_streaming_usage(vllm_server: InferenceEngineState):
+    """Abort a non-streaming request mid-flight and confirm usage still arrives."""
+    base_url = _get_base_url(vllm_server)
+    payload = _build_abort_test_payload(stream=False)
+
+    result: Dict[str, Any] = {}
+
+    def send_request():
+        response = requests.post(f"{base_url}/chat/completions", json=payload, timeout=300)
+        result["status_code"] = response.status_code
+        result["body"] = response.json()
+
+    request_thread = threading.Thread(target=send_request, daemon=True)
+    request_thread.start()
+
+    try:
+        # Give the request time to enter generation before forcing ABORT pause.
+        asyncio.run(asyncio.sleep(1.5))
+        asyncio.run(vllm_server.client.pause(mode=PauseMode.ABORT))
+        request_thread.join(timeout=300)
+
+        assert not request_thread.is_alive(), "Non-streaming request did not finish after abort."
+        assert result["status_code"] == HTTPStatus.OK, result
+        body = result["body"]
+        assert body["choices"][0]["finish_reason"] == "abort", body
+        assert "usage" in body and body["usage"] is not None, body
+        assert body["usage"]["prompt_tokens"] > 0, body
+        assert body["usage"]["completion_tokens"] >= 0, body
+    finally:
+        asyncio.run(vllm_server.client.resume())
+
+
+@pytest.mark.vllm
+def test_chat_completions_abort_streaming_usage(vllm_server: InferenceEngineState):
+    """Abort a streaming request mid-flight and confirm the final stream still carries usage."""
+    base_url = _get_base_url(vllm_server)
+    payload = _build_abort_test_payload(stream=True, max_tokens=900)
+
+    result: Dict[str, Any] = {"events": []}
+
+    def send_request():
+        with requests.post(f"{base_url}/chat/completions", json=payload, stream=True, timeout=300) as response:
+            result["status_code"] = response.status_code
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    result["saw_done"] = True
+                    break
+                event = json.loads(data)
+                result["events"].append(event)
+
+    request_thread = threading.Thread(target=send_request, daemon=True)
+    request_thread.start()
+
+    try:
+        # Abort quickly so the request is still in-flight when /pause lands.
+        time.sleep(0.1)
+        asyncio.run(vllm_server.client.pause(mode=PauseMode.ABORT))
+        request_thread.join(timeout=300)
+
+        assert not request_thread.is_alive(), "Streaming request did not finish after abort."
+        assert result["status_code"] == HTTPStatus.OK, result
+        assert result.get("saw_done") is True, result
+
+        finish_reasons = [
+            choice.get("finish_reason")
+            for event in result["events"]
+            for choice in event.get("choices", [])
+            if choice.get("finish_reason") is not None
+        ]
+        usage_events = [event for event in result["events"] if event.get("usage") is not None]
+
+        assert "abort" in finish_reasons, result["events"]
+        assert usage_events, result["events"]
+        final_usage = usage_events[-1]["usage"]
+        assert final_usage["prompt_tokens"] > 0, final_usage
+        assert final_usage["completion_tokens"] >= 0, final_usage
+    finally:
+        asyncio.run(vllm_server.client.resume())
 
 
 @pytest.mark.vllm

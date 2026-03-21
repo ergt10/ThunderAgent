@@ -14,8 +14,19 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, BitsAndByt
 import numpy as np
 from skyrl.backends.skyrl_train.distributed.ulysses.utils import ulysses_pad_and_slice_inputs, gather_outputs_and_unpad
 from skyrl.backends.skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
-from flash_attn.bert_padding import pad_input, unpad_input
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+except ModuleNotFoundError:
+    pad_input = None
+    unpad_input = None
 from packaging.version import Version
+
+
+def _require_flash_attn() -> None:
+    if pad_input is None or unpad_input is None:
+        raise ModuleNotFoundError(
+            "flash_attn is required when `trainer.flash_attn=true` or `trainer.use_sample_packing=true`."
+        )
 
 
 class HFModelWrapper(nn.Module):
@@ -68,10 +79,13 @@ class HFModelWrapper(nn.Module):
         super().__init__()
         self.temperature = temperature
         self.sequence_parallel_size = sequence_parallel_size
+        if use_flash_attention_2:
+            _require_flash_attn()
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
         self.use_sample_packing = use_sample_packing
         # packing samples using Flash Attention 2
         if use_sample_packing:
+            _require_flash_attn()
             assert (
                 self.attn_implementation == "flash_attention_2"
             ), "Flash attention 2 should be used for `use_sample_packing`"
@@ -416,6 +430,7 @@ def _get_critic_model(
             self.sequence_parallel_size = sequence_parallel_size
             self.use_sample_packing = use_sample_packing
             if use_sample_packing:
+                _require_flash_attn()
                 assert (
                     config._attn_implementation == "flash_attention_2"
                 ), "Flash attention must be used with sample packing"
@@ -536,6 +551,8 @@ def get_llm_for_sequence_regression(
         nn.Module: pretrained transformer model.
     """
     assert model_type == "critic", f"Only model_type critic is supported, got: {model_type}."
+    if use_flash_attention_2 or use_sample_packing:
+        _require_flash_attn()
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
     config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"

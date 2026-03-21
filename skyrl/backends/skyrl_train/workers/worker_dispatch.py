@@ -8,6 +8,7 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -283,6 +284,9 @@ class WorkerDispatch:
 
     def _save_memory_snapshot(self, model: str, tag: str) -> None:
         """Save memory snapshot on workers."""
+        save_every_step = os.environ.get("SKYRL_SAVE_MEMORY_SNAPSHOT_EVERY_STEP", "1").lower()
+        if save_every_step in {"0", "false", "no"}:
+            return
         ray.get(
             self._actor_groups[model].async_run_ray_method("pass_through", "save_memory_snapshot", tag=f"{model}_{tag}")
         )
@@ -428,6 +432,22 @@ class WorkerDispatch:
             for group in self._actor_groups.values():
                 refs.extend(group.async_run_ray_method("pass_through", "empty_cache"))
             ray.get(refs)
+
+    def get_memory_breakdown(self, model: str) -> Dict[str, float]:
+        """Aggregate allocator and tensor-storage memory breakdown across all workers for a model."""
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "get_memory_breakdown")
+        worker_stats = ray.get(refs)
+        if not worker_stats:
+            return {}
+
+        aggregated: Dict[str, float] = {"num_workers": float(len(worker_stats))}
+        keys = sorted({key for stats in worker_stats for key in stats.keys()})
+        for key in keys:
+            values = [float(stats.get(key, 0.0)) for stats in worker_stats]
+            aggregated[f"{key}_sum"] = sum(values)
+            aggregated[f"{key}_max"] = max(values)
+            aggregated[f"{key}_mean"] = sum(values) / len(values)
+        return aggregated
 
     def get_node_ids(self) -> List[str]:
         """Get unique node IDs from all actor groups."""

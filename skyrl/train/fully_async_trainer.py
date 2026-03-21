@@ -482,11 +482,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
             # End of an epoch.
         pbar.close()
-        if self.cfg.trainer.ckpt_interval > 0:
+        if self.cfg.trainer.ckpt_interval > 0 and self.cfg.trainer.save_final_checkpoint_at_end:
             with Timer("save_checkpoints", self.all_timings):
                 await asyncio.to_thread(self.save_checkpoints)
                 logger.info("Saved final checkpoint.")
-        if self.cfg.trainer.hf_save_interval > 0:
+        if self.cfg.trainer.hf_save_interval > 0 and self.cfg.trainer.save_final_hf_model_at_end:
             with Timer("save_hf_model", self.all_timings):
                 await asyncio.to_thread(self.save_models)
                 logger.info("Saved final model.")

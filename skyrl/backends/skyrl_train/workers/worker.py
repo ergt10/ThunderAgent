@@ -1,14 +1,19 @@
 import asyncio
+import json
 import logging
 import os
 import socket
+import subprocess
+import time
+from collections.abc import Mapping
 from collections import defaultdict
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type, Union, TYPE_CHECKING
 from omegaconf import OmegaConf
 
+import aiohttp
 import ray
 import torch
 import torch.distributed
@@ -105,7 +110,53 @@ class DistributedTorchRayActor:
     def get_node_local_rank(self):
         return self._local_rank
 
+    @staticmethod
+    def _socket_ifname_exists(ifname: str) -> bool:
+        return bool(ifname) and (Path("/sys/class/net") / ifname).exists()
+
+    @staticmethod
+    def _is_usable_socket_ifname(ifname: str) -> bool:
+        if not ifname:
+            return False
+        if ifname == "lo":
+            return False
+        return not (ifname.startswith("docker") or ifname.startswith("br-") or ifname.startswith("veth"))
+
+    def _ensure_local_socket_ifname(self) -> None:
+        repo_root = Path(__file__).resolve().parents[4]
+        detect_script = repo_root / "examples" / "train_integrations" / "harbor" / "detect_socket_ifname.sh"
+        if not detect_script.exists():
+            return
+
+        try:
+            result = subprocess.run(
+                ["bash", str(detect_script), self._master_addr],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to detect local socket interface for distributed init: {exc}")
+            return
+
+        detected_ifname = result.stdout.strip()
+        if not self._is_usable_socket_ifname(detected_ifname):
+            return
+
+        for env_name in ("NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME"):
+            current_ifname = os.environ.get(env_name, "").strip()
+            if current_ifname and "," in current_ifname:
+                continue
+            if self._socket_ifname_exists(current_ifname) and self._is_usable_socket_ifname(current_ifname):
+                continue
+            if current_ifname and current_ifname != detected_ifname:
+                logger.warning(
+                    f"{env_name}={current_ifname!r} is not present on this node; overriding with {detected_ifname!r}"
+                )
+            os.environ[env_name] = detected_ifname
+
     def init_worker_process_group(self):
+        self._ensure_local_socket_ifname()
         if not torch.distributed.is_initialized():
             # Default torch dist pg init timeout is 10 minutes (600 seconds)
             torch.distributed.init_process_group(
@@ -222,6 +273,9 @@ class Worker(DistributedTorchRayActor):
         super().__init__(*args, **kwargs)
         self.cfg = cfg
         self._transfer_strategy_cls = None  # Set in init_weight_transfer_communicator
+        self._memory_event_count = 0
+        self._last_memory_event_breakdown: Optional[Dict[str, Any]] = None
+        self._memory_event_log_path: Optional[str] = None
 
         if self.cfg.algorithm.temperature is None:
             raise ValueError("`cfg.algorithm.temperature` must be set")
@@ -263,6 +317,221 @@ class Worker(DistributedTorchRayActor):
             "free": free,
             "total": total,
         }
+
+    def get_memory_breakdown(self) -> Dict[str, Any]:
+        """Get allocator and tensor-storage memory breakdown for this worker's CUDA device."""
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        stats = torch.cuda.memory_stats()
+        reserved = torch.cuda.memory_reserved()
+        allocated = torch.cuda.memory_allocated()
+
+        model = getattr(self, "model", None)
+        optimizer = getattr(self, "optimizer", None)
+
+        model_param_bytes_cuda = self._sum_iterable_tensor_bytes(
+            list(model.parameters()) if model is not None else [],
+            device_type="cuda",
+        )
+        model_param_bytes_cpu = self._sum_iterable_tensor_bytes(
+            list(model.parameters()) if model is not None else [],
+            device_type="cpu",
+        )
+        model_buffer_bytes_cuda = self._sum_iterable_tensor_bytes(
+            list(model.buffers()) if model is not None else [],
+            device_type="cuda",
+        )
+        model_buffer_bytes_cpu = self._sum_iterable_tensor_bytes(
+            list(model.buffers()) if model is not None else [],
+            device_type="cpu",
+        )
+        grad_bytes_cuda = self._sum_iterable_tensor_bytes(
+            [param.grad for param in model.parameters()] if model is not None else [],
+            device_type="cuda",
+        )
+        grad_bytes_cpu = self._sum_iterable_tensor_bytes(
+            [param.grad for param in model.parameters()] if model is not None else [],
+            device_type="cpu",
+        )
+
+        optimizer_state = optimizer.state if optimizer is not None else {}
+        optimizer_state_bytes_cuda = self._sum_nested_tensor_bytes(optimizer_state, device_type="cuda")
+        optimizer_state_bytes_cpu = self._sum_nested_tensor_bytes(optimizer_state, device_type="cpu")
+
+        return {
+            "cuda_allocated_bytes": allocated,
+            "cuda_reserved_bytes": reserved,
+            "cuda_free_bytes": free,
+            "cuda_total_bytes": total,
+            "cuda_reserved_unallocated_bytes": max(0, reserved - allocated),
+            "cuda_active_bytes": stats.get("active_bytes.all.current", 0),
+            "cuda_requested_bytes": stats.get("requested_bytes.all.current", 0),
+            "cuda_inactive_split_bytes": stats.get("inactive_split_bytes.all.current", 0),
+            "cuda_fragmentation_proxy_bytes": stats.get("inactive_split_bytes.all.current", 0),
+            "model_param_bytes_cuda": model_param_bytes_cuda,
+            "model_param_bytes_cpu": model_param_bytes_cpu,
+            "model_buffer_bytes_cuda": model_buffer_bytes_cuda,
+            "model_buffer_bytes_cpu": model_buffer_bytes_cpu,
+            "grad_bytes_cuda": grad_bytes_cuda,
+            "grad_bytes_cpu": grad_bytes_cpu,
+            "optimizer_state_bytes_cuda": optimizer_state_bytes_cuda,
+            "optimizer_state_bytes_cpu": optimizer_state_bytes_cpu,
+        }
+
+    def _memory_event_enabled(self) -> bool:
+        return bool(self.record_memory or getattr(self.cfg, "collect_memory_metrics", False))
+
+    def _get_memory_event_log_path(self) -> str:
+        if self._memory_event_log_path is None:
+            event_dir = os.path.join(self.cfg.log_path, "memory_events")
+            os.makedirs(event_dir, exist_ok=True)
+            role = type(self).__name__.lower()
+            self._memory_event_log_path = os.path.join(
+                event_dir,
+                f"{role}_rank{self._rank:02d}_local{self._local_rank}_pid{os.getpid()}.jsonl",
+            )
+        return self._memory_event_log_path
+
+    @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, torch.Size):
+            return list(value)
+        if isinstance(value, torch.device):
+            return str(value)
+        if isinstance(value, Mapping):
+            return {str(key): Worker._to_jsonable(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [Worker._to_jsonable(item) for item in value]
+        if hasattr(value, "tolist") and callable(value.tolist):
+            try:
+                return value.tolist()
+            except Exception:
+                pass
+        if hasattr(value, "item") and callable(value.item):
+            try:
+                return value.item()
+            except Exception:
+                pass
+        return repr(value)
+
+    def _get_mesh_rank_payload(self) -> Optional[Dict[str, int]]:
+        if getattr(self, "mesh_rank", None) is None:
+            return None
+        return {
+            "dp": self.mesh_rank.dp,
+            "sp": self.mesh_rank.sp,
+            "tp": self.mesh_rank.tp,
+            "pp": self.mesh_rank.pp,
+            "world_size": self.mesh_rank.world_size,
+            "dp_size": self.mesh_rank.dp_size,
+            "pp_size": self.mesh_rank.pp_size,
+        }
+
+    def log_memory_event(self, reason: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        if not self._memory_event_enabled():
+            return
+
+        try:
+            breakdown = self.get_memory_breakdown()
+            self._memory_event_count += 1
+            previous = self._last_memory_event_breakdown or {}
+            delta = {}
+            for key in (
+                "cuda_allocated_bytes",
+                "cuda_reserved_bytes",
+                "cuda_free_bytes",
+                "cuda_active_bytes",
+                "cuda_requested_bytes",
+                "model_param_bytes_cuda",
+                "grad_bytes_cuda",
+                "optimizer_state_bytes_cuda",
+            ):
+                if key in previous:
+                    delta[key] = breakdown[key] - previous.get(key, 0)
+
+            payload = {
+                "timestamp": datetime.now().isoformat(timespec="microseconds"),
+                "timestamp_ns": time.time_ns(),
+                "event_index": self._memory_event_count,
+                "reason": reason,
+                "worker_role": type(self).__name__,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "rank": self._rank,
+                "local_rank": self._local_rank,
+                "gpu_id": self.get_gpu_id(),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "mesh_rank": self._get_mesh_rank_payload(),
+                "metrics": breakdown,
+                "delta_from_previous_event": delta,
+                "extra": self._to_jsonable(extra or {}),
+            }
+
+            with open(self._get_memory_event_log_path(), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+            self._last_memory_event_breakdown = breakdown
+        except Exception as exc:
+            logger.warning(f"Failed to write memory event '{reason}' on rank {self._rank}: {exc}")
+
+    def log_exception_memory_event(
+        self,
+        reason: str,
+        exc: BaseException,
+        extra: Optional[Dict[str, Any]] = None,
+        snapshot_tag: Optional[str] = None,
+    ) -> None:
+        payload = dict(extra or {})
+        payload.update(
+            {
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            }
+        )
+        self.log_memory_event(reason, payload)
+
+        if self.record_memory and snapshot_tag is not None:
+            try:
+                self.save_memory_snapshot(snapshot_tag)
+            except Exception as snapshot_exc:
+                logger.warning(f"Failed to save memory snapshot '{snapshot_tag}' on rank {self._rank}: {snapshot_exc}")
+
+    @staticmethod
+    def _sum_iterable_tensor_bytes(items: List[Any], device_type: Optional[str]) -> int:
+        return Worker._sum_nested_tensor_bytes(items, device_type=device_type)
+
+    @staticmethod
+    def _sum_nested_tensor_bytes(item: Any, device_type: Optional[str] = None) -> int:
+        total = 0
+        seen_tensors = set()
+
+        def _visit(obj: Any):
+            nonlocal total
+            if obj is None:
+                return
+            if torch.is_tensor(obj):
+                if device_type is not None and obj.device.type != device_type:
+                    return
+                key = (obj.device.type, obj.device.index, obj.data_ptr(), obj.numel(), obj.element_size())
+                if key in seen_tensors:
+                    return
+                seen_tensors.add(key)
+                total += obj.numel() * obj.element_size()
+                return
+            if isinstance(obj, Mapping):
+                for value in obj.values():
+                    _visit(value)
+                return
+            if isinstance(obj, (list, tuple, set)):
+                for value in obj:
+                    _visit(value)
+
+        _visit(item)
+        return total
 
     def save_memory_snapshot(self, tag: str = ""):
         """Save a snapshot of memory usage on the Worker's CUDA device.
@@ -324,7 +593,26 @@ class Worker(DistributedTorchRayActor):
         # For legacy path, calculate from config
         inference_world_size = None
         if _SKYRL_USE_NEW_INFERENCE and hasattr(inference_engine_client, "get_world_size"):
-            inference_world_size = await inference_engine_client.get_world_size()
+            try:
+                inference_world_size = await inference_engine_client.get_world_size()
+            except aiohttp.ClientResponseError as exc:
+                has_external_servers = (
+                    not inference_engine_cfg.run_engines_locally
+                    and inference_engine_cfg.external_server_urls is not None
+                )
+                if not has_external_servers or exc.status != 404:
+                    raise
+
+                inference_world_size = (
+                    inference_engine_cfg.num_engines
+                    * inference_engine_cfg.tensor_parallel_size
+                    * inference_engine_cfg.pipeline_parallel_size
+                    * inference_engine_cfg.data_parallel_size
+                )
+                logger.warning(
+                    "External inference servers do not expose /get_server_info yet; "
+                    f"falling back to config-derived inference_world_size={inference_world_size}"
+                )
 
         # Create init info on all ranks (it's deterministic from cfg or fetched world_size)
         init_info = self._transfer_strategy_cls.create_init_info(
@@ -697,9 +985,25 @@ class PolicyWorkerBase(Worker):
         micro_batch_size = self.cfg.micro_train_batch_size_per_gpu
         all_metrics = defaultdict(list)
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
+        self._forward_backward_call_index = getattr(self, "_forward_backward_call_index", 0) + 1
+        forward_backward_call_index = self._forward_backward_call_index
+        self.log_memory_event(
+            "policy_forward_backward_start",
+            {
+                "forward_backward_call_index": forward_backward_call_index,
+                "micro_batch_size": micro_batch_size,
+                "local_batch_size": len(data),
+            },
+        )
 
-        for micro_batch in BatchIterator(data, micro_batch_size, drop_last=False):
-            metrics = self._forward_backward_micro(micro_batch, loss_fn=loss_fn, loss_fn_config=loss_fn_config)
+        for micro_batch_index, micro_batch in enumerate(BatchIterator(data, micro_batch_size, drop_last=False), start=1):
+            metrics = self._forward_backward_micro(
+                micro_batch,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                forward_backward_call_index=forward_backward_call_index,
+                micro_batch_index=micro_batch_index,
+            )
             self._micro_batches_accumulated += 1
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
@@ -714,6 +1018,15 @@ class PolicyWorkerBase(Worker):
         # Add back loss_fn_outputs (concatenated across micro-batches)
         if all_loss_fn_outputs:
             result["loss_fn_outputs"] = all_loss_fn_outputs
+
+        self.log_memory_event(
+            "policy_forward_backward_end",
+            {
+                "forward_backward_call_index": forward_backward_call_index,
+                "micro_batches_accumulated": self._micro_batches_accumulated,
+                "metric_keys": sorted(result.keys()),
+            },
+        )
 
         return result
 
@@ -751,6 +1064,8 @@ class PolicyWorkerBase(Worker):
         experience: Experience,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        forward_backward_call_index: Optional[int] = None,
+        micro_batch_index: Optional[int] = None,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
@@ -767,6 +1082,11 @@ class PolicyWorkerBase(Worker):
         """
         self.model.train()
 
+        micro_context = {
+            "forward_backward_call_index": forward_backward_call_index,
+            "micro_batch_index": micro_batch_index,
+        }
+        self.log_memory_event("policy_micro_pre_to_device", micro_context)
         experience.to_device(torch.cuda.current_device())
 
         sequences = experience.sequences
@@ -780,6 +1100,18 @@ class PolicyWorkerBase(Worker):
         loss_mask = experience.loss_mask
         action_mask = experience.action_mask
         rollout_action_logprobs = experience.rollout_logprobs
+        micro_context.update(
+            {
+                "sequences_shape": list(sequences.shape),
+                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+                "loss_mask_shape": list(loss_mask.shape) if loss_mask is not None else None,
+                "action_mask_shape": list(action_mask.shape) if action_mask is not None else None,
+                "num_actions": num_actions,
+                "has_base_action_log_probs": base_action_log_probs is not None,
+                "has_rollout_logprobs": rollout_action_logprobs is not None,
+            }
+        )
+        self.log_memory_event("policy_micro_post_to_device", micro_context)
 
         # Determine which loss function to use
         resolved_loss_name = loss_fn if loss_fn is not None else self.cfg.algorithm.policy_loss_type
@@ -802,32 +1134,78 @@ class PolicyWorkerBase(Worker):
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
-        with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
-            # actor loss
-            action_log_probs, output = self.model(
-                sequences,
-                num_actions,
-                attention_mask=attention_mask,
-                temperature=self.cfg.algorithm.temperature,
-                return_output=True,
-                compute_entropy=True,
-                entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
+        try:
+            self.log_memory_event(
+                "policy_micro_pre_forward",
+                {
+                    **micro_context,
+                    "loss_fn": resolved_loss_name,
+                    "use_entropy_loss": self.cfg.algorithm.use_entropy_loss,
+                    "use_kl_loss": self.cfg.algorithm.use_kl_loss,
+                },
             )
-            # loss function
-            # TODO: recompute advantages
-            policy_loss, loss_metrics = current_loss_fn(
-                action_log_probs,
-                old_action_log_probs,
-                advantages,
-                config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
+            with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
+                # actor loss
+                action_log_probs, output = self.model(
+                    sequences,
+                    num_actions,
+                    attention_mask=attention_mask,
+                    temperature=self.cfg.algorithm.temperature,
+                    return_output=True,
+                    compute_entropy=True,
+                    entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
+                )
+                self.log_memory_event(
+                    "policy_micro_post_forward",
+                    {
+                        **micro_context,
+                        "action_log_probs_shape": list(action_log_probs.shape),
+                        "entropy_shape": (
+                            list(output["entropy"].shape) if "entropy" in output and output["entropy"] is not None else None
+                        ),
+                    },
+                )
+                # loss function
+                # TODO: recompute advantages
+                policy_loss, loss_metrics = current_loss_fn(
+                    action_log_probs,
+                    old_action_log_probs,
+                    advantages,
+                    config=loss_config,
+                    loss_mask=loss_mask,
+                    rollout_logprobs=rollout_action_logprobs,
+                )
+            self.log_memory_event(
+                "policy_micro_post_loss_build",
+                {
+                    **micro_context,
+                    "policy_loss": float(policy_loss.detach().cpu().item()),
+                },
             )
+        except BaseException as exc:
+            self.log_exception_memory_event(
+                "policy_micro_exception_before_backward",
+                exc,
+                extra=micro_context,
+                snapshot_tag="policy_micro_exception_before_backward",
+            )
+            raise
 
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":
             loss = policy_loss
-            self.strategy.backward(loss, self.model, self.optimizer)
+            self.log_memory_event("policy_micro_pre_backward", {**micro_context, "loss_mode": "cross_entropy"})
+            try:
+                self.strategy.backward(loss, self.model, self.optimizer)
+            except BaseException as exc:
+                self.log_exception_memory_event(
+                    "policy_micro_backward_exception",
+                    exc,
+                    extra={**micro_context, "loss_mode": "cross_entropy"},
+                    snapshot_tag="policy_micro_backward_exception",
+                )
+                raise
+            self.log_memory_event("policy_micro_post_backward", {**micro_context, "loss_mode": "cross_entropy"})
 
             # Compute elementwise loss for Tinker API (per-token NLL)
             with torch.no_grad():
@@ -890,7 +1268,33 @@ class PolicyWorkerBase(Worker):
             kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef
 
             loss = policy_loss + kl_loss_term - entropy_loss_term
-            self.strategy.backward(loss, self.model, self.optimizer)
+            self.log_memory_event(
+                "policy_micro_pre_backward",
+                {
+                    **micro_context,
+                    "loss_mode": "rl",
+                    "loss": float(loss.detach().cpu().item()),
+                    "kl_loss_term": float(kl_loss_term.detach().cpu().item()),
+                    "entropy_loss_term": float(entropy_loss_term.detach().cpu().item()),
+                },
+            )
+            try:
+                self.strategy.backward(loss, self.model, self.optimizer)
+            except BaseException as exc:
+                self.log_exception_memory_event(
+                    "policy_micro_backward_exception",
+                    exc,
+                    extra={**micro_context, "loss_mode": "rl"},
+                    snapshot_tag="policy_micro_backward_exception",
+                )
+                raise
+            self.log_memory_event(
+                "policy_micro_post_backward",
+                {
+                    **micro_context,
+                    "loss_mode": "rl",
+                },
+            )
 
             # Build per-sequence loss_fn_outputs with logprobs.
             batch_size = action_log_probs.shape[0]
@@ -943,21 +1347,53 @@ class PolicyWorkerBase(Worker):
         Returns:
             The gradient norm (before scaling, after clipping)
         """
+        self._optim_step_call_index = getattr(self, "_optim_step_call_index", 0) + 1
+        optim_step_call_index = self._optim_step_call_index
+        self.log_memory_event(
+            "policy_optim_step_start",
+            {
+                "optim_step_call_index": optim_step_call_index,
+                "micro_batches_accumulated": self._micro_batches_accumulated,
+            },
+        )
         # Scale accumulated gradients by 1/N to get correct average
         if self._micro_batches_accumulated > 0:
             scale = 1.0 / self._micro_batches_accumulated
             for param in self.model.parameters():
                 if param.grad is not None:
                     param.grad.mul_(scale)
+        self.log_memory_event(
+            "policy_optim_step_post_grad_scale",
+            {
+                "optim_step_call_index": optim_step_call_index,
+                "gradient_scale": (1.0 / self._micro_batches_accumulated) if self._micro_batches_accumulated > 0 else None,
+            },
+        )
 
         # Perform optimizer step (includes gradient clipping)
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        try:
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        except BaseException as exc:
+            self.log_exception_memory_event(
+                "policy_optim_step_exception",
+                exc,
+                extra={"optim_step_call_index": optim_step_call_index},
+                snapshot_tag="policy_optim_step_exception",
+            )
+            raise
 
         # Reset counter for next accumulation cycle
         self._micro_batches_accumulated = 0
 
         if grad_norm is not None:
             grad_norm = grad_norm.detach().cpu().item()
+        self.log_memory_event(
+            "policy_optim_step_end",
+            {
+                "optim_step_call_index": optim_step_call_index,
+                "grad_norm": grad_norm,
+            },
+        )
         return grad_norm
 
     def get_lr(self) -> float:
@@ -1015,11 +1451,26 @@ class PolicyWorkerBase(Worker):
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
+        self._forward_call_index = getattr(self, "_forward_call_index", 0) + 1
+        forward_call_index = self._forward_call_index
+        self.log_memory_event(
+            "policy_forward_micro_pre_to_device",
+            {
+                "forward_call_index": forward_call_index,
+            },
+        )
         micro_batch.to(device)
         self.model.eval()
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
+        forward_context = {
+            "forward_call_index": forward_call_index,
+            "sequences_shape": list(sequences.shape),
+            "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+            "response_length": response_length,
+        }
+        self.log_memory_event("policy_forward_micro_pre_forward", forward_context)
 
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             policy_logprob = self.model(
@@ -1029,7 +1480,15 @@ class PolicyWorkerBase(Worker):
                 return_output=False,
                 temperature=self.cfg.algorithm.temperature,
             )
+        self.log_memory_event(
+            "policy_forward_micro_post_forward",
+            {
+                **forward_context,
+                "policy_logprob_shape": list(policy_logprob.shape),
+            },
+        )
         policy_logprob = policy_logprob.to("cpu")
+        self.log_memory_event("policy_forward_micro_post_to_cpu", forward_context)
         output = TrainingOutputBatch(
             {"output": policy_logprob},
         )
@@ -1067,14 +1526,37 @@ class CriticWorkerBase(Worker):
         """
         micro_batch_size = self.cfg.micro_train_batch_size_per_gpu
         all_metrics = defaultdict(list)
+        self._forward_backward_call_index = getattr(self, "_forward_backward_call_index", 0) + 1
+        forward_backward_call_index = self._forward_backward_call_index
+        self.log_memory_event(
+            "critic_forward_backward_start",
+            {
+                "forward_backward_call_index": forward_backward_call_index,
+                "micro_batch_size": micro_batch_size,
+                "local_batch_size": len(data),
+            },
+        )
 
-        for micro_batch in BatchIterator(data, micro_batch_size, drop_last=False):
-            metrics = self._forward_backward_micro(micro_batch)
+        for micro_batch_index, micro_batch in enumerate(BatchIterator(data, micro_batch_size, drop_last=False), start=1):
+            metrics = self._forward_backward_micro(
+                micro_batch,
+                forward_backward_call_index=forward_backward_call_index,
+                micro_batch_index=micro_batch_index,
+            )
             self._micro_batches_accumulated += 1
             for k, v in metrics.items():
                 all_metrics[k].append(v)
 
-        return reduce_metrics(dict(all_metrics))
+        result = reduce_metrics(dict(all_metrics))
+        self.log_memory_event(
+            "critic_forward_backward_end",
+            {
+                "forward_backward_call_index": forward_backward_call_index,
+                "micro_batches_accumulated": self._micro_batches_accumulated,
+                "metric_keys": sorted(result.keys()),
+            },
+        )
+        return result
 
     def forward_backward_from_staged(self, data: TrainingInputBatch, start_idx: int, end_idx: int) -> Dict[str, float]:
         """
@@ -1096,7 +1578,12 @@ class CriticWorkerBase(Worker):
         # Delegate to regular forward_backward
         return self.forward_backward(data)
 
-    def _forward_backward_micro(self, experience: Experience) -> Dict[str, float]:
+    def _forward_backward_micro(
+        self,
+        experience: Experience,
+        forward_backward_call_index: Optional[int] = None,
+        micro_batch_index: Optional[int] = None,
+    ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
 
@@ -1110,6 +1597,11 @@ class CriticWorkerBase(Worker):
         """
         self.model.train()
 
+        micro_context = {
+            "forward_backward_call_index": forward_backward_call_index,
+            "micro_batch_index": micro_batch_index,
+        }
+        self.log_memory_event("critic_micro_pre_to_device", micro_context)
         experience.to_device(torch.cuda.current_device())
 
         sequences = experience.sequences
@@ -1118,25 +1610,69 @@ class CriticWorkerBase(Worker):
         num_actions = experience.num_actions
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
+        micro_context.update(
+            {
+                "sequences_shape": list(sequences.shape),
+                "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+                "loss_mask_shape": list(loss_mask.shape) if loss_mask is not None else None,
+                "num_actions": num_actions,
+            }
+        )
+        self.log_memory_event("critic_micro_post_to_device", micro_context)
 
-        with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
-            # critic loss
-            values, _ = self.model(
-                sequences,
-                num_actions=num_actions,
-                attention_mask=attention_mask,
-                return_output=True,
+        try:
+            self.log_memory_event("critic_micro_pre_forward", micro_context)
+            with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
+                # critic loss
+                values, _ = self.model(
+                    sequences,
+                    num_actions=num_actions,
+                    attention_mask=attention_mask,
+                    return_output=True,
+                )
+                self.log_memory_event(
+                    "critic_micro_post_forward",
+                    {
+                        **micro_context,
+                        "values_shape": list(values.shape),
+                    },
+                )
+                # loss function
+                loss, clipfrac = self.critic_loss_fn(
+                    values,
+                    old_values,
+                    returns,
+                    config=self.cfg.algorithm,
+                    loss_mask=loss_mask,
+                )
+            self.log_memory_event(
+                "critic_micro_post_loss_build",
+                {
+                    **micro_context,
+                    "critic_loss": float(loss.detach().cpu().item()),
+                },
             )
-            # loss function
-            loss, clipfrac = self.critic_loss_fn(
-                values,
-                old_values,
-                returns,
-                config=self.cfg.algorithm,
-                loss_mask=loss_mask,
+        except BaseException as exc:
+            self.log_exception_memory_event(
+                "critic_micro_exception_before_backward",
+                exc,
+                extra=micro_context,
+                snapshot_tag="critic_micro_exception_before_backward",
             )
+            raise
         # NO loss scaling here - gradient scaling happens at optim_step
-        self.strategy.backward(loss, self.model, self.optimizer)
+        self.log_memory_event("critic_micro_pre_backward", micro_context)
+        try:
+            self.strategy.backward(loss, self.model, self.optimizer)
+        except BaseException as exc:
+            self.log_exception_memory_event(
+                "critic_micro_backward_exception",
+                exc,
+                extra=micro_context,
+                snapshot_tag="critic_micro_backward_exception",
+            )
+            raise
+        self.log_memory_event("critic_micro_post_backward", micro_context)
 
         status = {
             "critic_loss": loss.item(),
@@ -1157,21 +1693,53 @@ class CriticWorkerBase(Worker):
         Returns:
             The gradient norm (before scaling, after clipping)
         """
+        self._optim_step_call_index = getattr(self, "_optim_step_call_index", 0) + 1
+        optim_step_call_index = self._optim_step_call_index
+        self.log_memory_event(
+            "critic_optim_step_start",
+            {
+                "optim_step_call_index": optim_step_call_index,
+                "micro_batches_accumulated": self._micro_batches_accumulated,
+            },
+        )
         # Scale accumulated gradients by 1/N to get correct average
         if self._micro_batches_accumulated > 0:
             scale = 1.0 / self._micro_batches_accumulated
             for param in self.model.parameters():
                 if param.grad is not None:
                     param.grad.mul_(scale)
+        self.log_memory_event(
+            "critic_optim_step_post_grad_scale",
+            {
+                "optim_step_call_index": optim_step_call_index,
+                "gradient_scale": (1.0 / self._micro_batches_accumulated) if self._micro_batches_accumulated > 0 else None,
+            },
+        )
 
         # Perform optimizer step (includes gradient clipping)
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="critic")
+        try:
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="critic")
+        except BaseException as exc:
+            self.log_exception_memory_event(
+                "critic_optim_step_exception",
+                exc,
+                extra={"optim_step_call_index": optim_step_call_index},
+                snapshot_tag="critic_optim_step_exception",
+            )
+            raise
 
         # Reset counter for next accumulation cycle
         self._micro_batches_accumulated = 0
 
         if grad_norm is not None:
             grad_norm = grad_norm.detach().cpu().item()
+        self.log_memory_event(
+            "critic_optim_step_end",
+            {
+                "optim_step_call_index": optim_step_call_index,
+                "grad_norm": grad_norm,
+            },
+        )
         return grad_norm
 
     def get_lr(self) -> float:
@@ -1202,10 +1770,20 @@ class CriticWorkerBase(Worker):
     ) -> TrainingOutputBatch:
         """Generates critic values."""
         device = torch.cuda.current_device()
+        self._forward_call_index = getattr(self, "_forward_call_index", 0) + 1
+        forward_call_index = self._forward_call_index
+        self.log_memory_event("critic_forward_micro_pre_to_device", {"forward_call_index": forward_call_index})
         micro_batch.to(device)
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
+        forward_context = {
+            "forward_call_index": forward_call_index,
+            "sequences_shape": list(sequences.shape),
+            "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+            "response_length": response_length,
+        }
+        self.log_memory_event("critic_forward_micro_pre_forward", forward_context)
         self.model.eval()
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             value = self.model(
@@ -1213,8 +1791,16 @@ class CriticWorkerBase(Worker):
                 response_length,
                 attention_mask,
             )
+        self.log_memory_event(
+            "critic_forward_micro_post_forward",
+            {
+                **forward_context,
+                "value_shape": list(value.shape),
+            },
+        )
         self.model.train()  # reset model state
         value = value.to("cpu")
+        self.log_memory_event("critic_forward_micro_post_to_cpu", forward_context)
         output = TrainingOutputBatch(
             {"output": value},
         )
@@ -1258,13 +1844,31 @@ class RefWorkerBase(Worker):
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
+        self._forward_call_index = getattr(self, "_forward_call_index", 0) + 1
+        forward_call_index = self._forward_call_index
+        self.log_memory_event("ref_forward_micro_pre_to_device", {"forward_call_index": forward_call_index})
         micro_batch.to(device)
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
+        forward_context = {
+            "forward_call_index": forward_call_index,
+            "sequences_shape": list(sequences.shape),
+            "attention_mask_shape": list(attention_mask.shape) if attention_mask is not None else None,
+            "response_length": response_length,
+        }
+        self.log_memory_event("ref_forward_micro_pre_forward", forward_context)
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             log_probs = self.model(sequences, response_length, attention_mask, return_output=False)
+        self.log_memory_event(
+            "ref_forward_micro_post_forward",
+            {
+                **forward_context,
+                "log_probs_shape": list(log_probs.shape),
+            },
+        )
         log_probs = log_probs.to("cpu")
+        self.log_memory_event("ref_forward_micro_post_to_cpu", forward_context)
         output = TrainingOutputBatch(
             {"output": log_probs},
         )

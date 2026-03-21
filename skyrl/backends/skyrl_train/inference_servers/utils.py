@@ -7,7 +7,10 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     """Build CLI args for vLLM server from config."""
     from vllm.entrypoints.openai.cli_args import FrontendArgs
     from vllm import AsyncEngineArgs
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except ModuleNotFoundError:
+        from vllm.utils import FlexibleArgumentParser
 
     # Create common CLI args namespace
     parser = FlexibleArgumentParser()

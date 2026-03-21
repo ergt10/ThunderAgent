@@ -573,8 +573,12 @@ class TrainerConfig(BaseConfig):
     max_ckpts_to_keep: int = -1
     """``-1`` to keep all checkpoints, ``N`` to keep only the last N."""
     ckpt_interval: int = 10
+    save_final_checkpoint_at_end: bool = True
+    """When True, save one more training checkpoint after the loop exits."""
     hf_save_interval: int = -1
     """Save HuggingFace-format model every N steps. ``-1`` to disable."""
+    save_final_hf_model_at_end: bool = True
+    """When True, save one more HuggingFace-format model after the loop exits."""
     export_path: str = field(default_factory=lambda: os.path.expanduser("~/exports/"))
     """Path for exported artifacts (HF models, debug dumps, etc.)."""
     bf16: bool = True
@@ -598,9 +602,16 @@ class TrainerConfig(BaseConfig):
     disable_fast_tokenizer: bool = False
     project_name: str = "skyrl"
     run_name: str = "test_run"
-    logger: str = "wandb"
+    logger: Any = "wandb"
+    collect_memory_metrics: bool = False
+    """Log per-step CUDA allocator and tensor-storage memory metrics from training workers."""
+    collect_memory_metrics_interval: int = 1
+    """Collect training memory metrics every N global steps."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
+    async_rollout: bool = False
+    """Overlap next-batch generation with current-batch training (1-step weight staleness).
+    Only effective when colocate_all=False. Ignored otherwise."""
     rope_scaling: Optional[Dict[str, Any]] = None
     rope_theta: Optional[float] = None
 

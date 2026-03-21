@@ -3,6 +3,7 @@ vLLM Server Actor - Ray actor running a vLLM OpenAI-compatible API server.
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import pickle
@@ -22,7 +23,10 @@ from vllm.entrypoints.openai.api_server import (
     init_app_state,
 )
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils.system_utils import set_ulimit
+try:
+    from vllm.utils.system_utils import set_ulimit
+except ModuleNotFoundError:
+    from vllm.utils import set_ulimit
 
 from skyrl.env_vars import (
     SKYRL_VLLM_DP_PORT_OFFSET,
@@ -147,6 +151,7 @@ class VLLMServerActor(ServerActorProtocol):
         # Initialized lazily to not block the actor initialization.
         self._engine: Optional[AsyncLLMEngine] = None
         self._server_task: Optional[asyncio.Task] = None
+        self._generation_paused = asyncio.Event()
 
     def _ensure_worker_extension(self) -> None:
         """
@@ -282,7 +287,11 @@ class VLLMServerActor(ServerActorProtocol):
         # Add custom SkyRL endpoints
         self._add_custom_endpoints(app)
 
-        await init_app_state(self._engine, app.state, self._cli_args)
+        if len(inspect.signature(init_app_state).parameters) == 4:
+            vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
+            await init_app_state(self._engine, vllm_config, app.state, self._cli_args)
+        else:
+            await init_app_state(self._engine, app.state, self._cli_args)
 
         # Use uvicorn directly (serve_http tries to add signal handlers which fails in Ray actors)
         config = uvicorn.Config(
@@ -303,6 +312,33 @@ class VLLMServerActor(ServerActorProtocol):
     def _add_custom_endpoints(self, app) -> None:
         """Add custom SkyRL endpoints to the FastAPI app."""
         engine = self._engine
+        paused_event = self._generation_paused
+
+        def _get_unfinished_request_ids(output_processor) -> list:
+            if hasattr(output_processor, "external_req_ids"):
+                return list(output_processor.external_req_ids.keys())
+            return list(output_processor.request_states.keys())
+
+        async def _abort_generation_requests() -> int:
+            output_processor = getattr(engine, "output_processor", None)
+            if output_processor is None:
+                return 0
+            unfinished_request_ids = _get_unfinished_request_ids(output_processor)
+            if unfinished_request_ids:
+                await engine.abort(unfinished_request_ids)
+            await engine.reset_prefix_cache()
+            return len(unfinished_request_ids)
+
+        @app.middleware("http")
+        async def _block_generation_when_paused(request: Request, call_next):
+            if paused_event.is_set() and request.method == "POST" and request.url.path in (
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/inference/v1/generate",
+            ):
+                while paused_event.is_set():
+                    await asyncio.sleep(0.05)
+            return await call_next(request)
 
         @app.get("/get_server_info")
         async def _get_server_info():
@@ -381,6 +417,40 @@ class VLLMServerActor(ServerActorProtocol):
         async def _reset_prefix_cache(request: Request):
             """Reset the prefix cache."""
             await engine.reset_prefix_cache()
+            return {"status": "ok"}
+
+        @app.post("/pause")
+        async def _pause(request: Request):
+            """Pause generation and optionally abort in-flight requests."""
+            data = await request.json()
+            wait_for_inflight_request = data.get("wait_for_inflight_request", False)
+            paused_event.set()
+            if wait_for_inflight_request:
+                return {"status": "ok", "aborted_requests": 0}
+            aborted_requests = await _abort_generation_requests()
+            return {"status": "ok", "aborted_requests": aborted_requests}
+
+        @app.post("/resume")
+        async def _resume(request: Request):
+            """Resume generation after a pause."""
+            paused_event.clear()
+            return {"status": "ok"}
+
+        @app.post("/sleep")
+        async def _sleep(request: Request):
+            """Offload model weights to CPU."""
+            data = await request.json()
+            level = data.get("level", 2)
+            await engine.reset_prefix_cache()
+            await engine.sleep(level)
+            return {"status": "ok"}
+
+        @app.post("/wake_up")
+        async def _wake_up(request: Request):
+            """Wake the model back up on GPU."""
+            data = await request.json()
+            tags = data.get("tags")
+            await engine.wake_up(tags)
             return {"status": "ok"}
 
     async def shutdown(self) -> None:

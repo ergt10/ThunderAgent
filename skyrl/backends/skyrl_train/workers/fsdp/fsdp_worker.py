@@ -94,12 +94,31 @@ class FSDPWeightExtractor(WeightExtractor):
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
         self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self.log_memory_event(
+            "policy_offload_to_cpu_start",
+            {
+                "pin_memory": pin_memory,
+                "non_blocking": non_blocking,
+                "offload_optimizer": offload_optimizer,
+                "offload_model": offload_model,
+            },
+        )
         self.strategy.offload_to_cpu(
             self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
+        self.log_memory_event("policy_offload_to_cpu_end")
 
     def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
+        self.log_memory_event(
+            "policy_backload_to_gpu_start",
+            {
+                "non_blocking": non_blocking,
+                "backload_optimizer": backload_optimizer,
+                "backload_model": backload_model,
+            },
+        )
         self.strategy.backload_to_gpu(self.model, self.optimizer, non_blocking, backload_optimizer, backload_model)
+        self.log_memory_event("policy_backload_to_gpu_end")
 
     def init_model(self, model_path, num_training_steps: int = None):
         assert self.cfg.strategy in ("fsdp", "fsdp2")
@@ -259,12 +278,31 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 class FSDPCriticWorkerBase(CriticWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
         self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self.log_memory_event(
+            "critic_offload_to_cpu_start",
+            {
+                "pin_memory": pin_memory,
+                "non_blocking": non_blocking,
+                "offload_optimizer": offload_optimizer,
+                "offload_model": offload_model,
+            },
+        )
         self.strategy.offload_to_cpu(
             self.model, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
         )
+        self.log_memory_event("critic_offload_to_cpu_end")
 
     def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
+        self.log_memory_event(
+            "critic_backload_to_gpu_start",
+            {
+                "non_blocking": non_blocking,
+                "backload_optimizer": backload_optimizer,
+                "backload_model": backload_model,
+            },
+        )
         self.strategy.backload_to_gpu(self.model, self.optimizer, non_blocking, backload_optimizer, backload_model)
+        self.log_memory_event("critic_backload_to_gpu_end")
 
     def init_model(self, model_path, num_training_steps: int = None):
         assert self.cfg.strategy in ("fsdp", "fsdp2")
@@ -333,10 +371,25 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
 class FSDPRefWorkerBase(RefWorkerBase):
     def offload_to_cpu(self, pin_memory=True, non_blocking=True, **kwargs):
         self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
+        self.log_memory_event(
+            "ref_offload_to_cpu_start",
+            {
+                "pin_memory": pin_memory,
+                "non_blocking": non_blocking,
+            },
+        )
         self.strategy.offload_to_cpu(self.model, None, pin_memory, non_blocking)
+        self.log_memory_event("ref_offload_to_cpu_end")
 
     def backload_to_gpu(self, non_blocking=True, **kwargs):
+        self.log_memory_event(
+            "ref_backload_to_gpu_start",
+            {
+                "non_blocking": non_blocking,
+            },
+        )
         self.strategy.backload_to_gpu(self.model, None, non_blocking)
+        self.log_memory_event("ref_backload_to_gpu_end")
 
     def init_model(self, model_path):
         assert self.cfg.strategy in ("fsdp", "fsdp2")
