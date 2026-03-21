@@ -332,7 +332,7 @@ fi
 if [ "$APPLY_HARBOR_ROOTLESS_PATCH" = true ]; then
   run_check \
     "Harbor rootless patch" \
-    bash -lc "'$PYTHON_BIN' '$OPS_DIR/apply_harbor_rootless_patch.py' --backup && '$PYTHON_BIN' '$OPS_DIR/apply_harbor_rootless_patch.py' --check"
+    bash -lc "'$PYTHON_BIN' '$OPS_DIR/apply_harbor_runtime_patches.py' --backup && '$PYTHON_BIN' '$OPS_DIR/apply_harbor_runtime_patches.py' --check"
 fi
 
 if [ "$CHECK_DATASETS" = true ]; then

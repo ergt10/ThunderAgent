@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+SHARED_TOOL_HOME="${HARBOR_SHARED_MINI_SWE_TOOL_ENV_HOME:-}"
+MINI_SWE_AGENT_GIT_REF="${HARBOR_MINI_SWE_AGENT_GIT_REF:-{% if version %}{{ version }}{% endif %}}"
+UV_CACHE_DIR="${HARBOR_SHARED_UV_CACHE_ENV_DIR:-/harbor-shared/uv-cache}"
+
+if [ -n "${SHARED_TOOL_HOME:-}" ] && [ -x "${SHARED_TOOL_HOME}/.local/bin/mini" ]; then
+    export PATH="${SHARED_TOOL_HOME}/.local/bin:$PATH"
+    if ! grep -qF "export PATH=\"${SHARED_TOOL_HOME}/.local/bin:\$PATH\"" "$HOME/.bashrc" 2>/dev/null; then
+        echo "export PATH=\"${SHARED_TOOL_HOME}/.local/bin:\$PATH\"" >> "$HOME/.bashrc"
+    fi
+    command -v mini >/dev/null
+    echo "USING_SHARED_PREINSTALLED_MINI_SWE_AGENT=${SHARED_TOOL_HOME}"
+    echo "INSTALL_SUCCESS"
+    exit 0
+fi
+
+# Install curl and build tools
+apt-get update
+apt-get install -y curl build-essential git
+
+# Install uv
+curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+
+# Ensure $HOME/.local/bin is in PATH via .bashrc
+if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc"; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+fi
+
+# Source the uv environment
+source "$HOME/.local/bin/env"
+
+mkdir -p "$UV_CACHE_DIR"
+
+PACKAGE_SPEC="git+https://github.com/li-boxuan/mini-swe-agent.git"
+if [ -n "${MINI_SWE_AGENT_GIT_REF:-}" ]; then
+    PACKAGE_SPEC="${PACKAGE_SPEC}@${MINI_SWE_AGENT_GIT_REF}"
+fi
+
+if [ "${HARBOR_MINI_SWE_AGENT_UV_OFFLINE:-}" = "1" ]; then
+    uv tool install --offline --cache-dir "$UV_CACHE_DIR" "$PACKAGE_SPEC"
+else
+    uv tool install --cache-dir "$UV_CACHE_DIR" "$PACKAGE_SPEC"
+fi
+
+echo "INSTALL_SUCCESS"

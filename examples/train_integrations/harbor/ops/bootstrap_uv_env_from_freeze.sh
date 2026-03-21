@@ -39,7 +39,7 @@ python3 "$SCRIPT_DIR/sanitize_freeze_for_uv.py" \
   -r "$SANITIZED_FILE"
 
 if [ "$APPLY_HARBOR_ROOTLESS_PATCH" = true ]; then
-  "$VENV_DIR/bin/python" "$SCRIPT_DIR/apply_harbor_rootless_patch.py" --backup
+  "$VENV_DIR/bin/python" "$SCRIPT_DIR/apply_harbor_runtime_patches.py" --backup
 fi
 
 echo "uv environment ready:"
