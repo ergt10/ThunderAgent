@@ -3,7 +3,14 @@ Main entrypoint for training with ThunderAgent program-aware scheduling.
 
 Uses ThunderAgentRouter (instead of InferenceRouter) for the new HTTP inference
 layer. ThunderAgent intercepts /v1/chat/completions for program scheduling
-while routing SkyRL's token-based generation endpoint through the same router.
+while passing all other data plane endpoints through as a catch-all proxy.
+
+Usage:
+    _SKYRL_USE_NEW_INFERENCE=1 uv run --extra fsdp --extra thunderagent \
+        -m examples.train.thunder_agent.main_thunder_agent \
+        generator.inference_engine.external_server_urls="['http://localhost:8000']" \
+        generator.inference_engine.thunder_agent_mode=tr \
+        trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct"
 """
 
 import faulthandler
@@ -28,10 +35,11 @@ class ThunderAgentExp(BasePPOExp):
     def get_inference_client(self) -> InferenceEngineInterface:
         if _SKYRL_USE_NEW_INFERENCE:
             return self._get_new_inference_client()
-        raise ValueError(
-            "ThunderAgent integration requires the new inference layer. "
-            "Set _SKYRL_USE_NEW_INFERENCE=1 environment variable."
-        )
+        else:
+            raise ValueError(
+                "ThunderAgent integration requires the new inference layer. "
+                "Set _SKYRL_USE_NEW_INFERENCE=1 environment variable."
+            )
 
     def _get_new_inference_client(self):
         """Override to use ThunderAgentRouter instead of InferenceRouter."""
@@ -51,9 +59,10 @@ class ThunderAgentExp(BasePPOExp):
             proxy_url = external_proxy_url
             server_urls = list(external_server_urls)
             logger.info(
-                "HTTP Inference (ThunderAgent): Using fully external setup - "
+                f"HTTP Inference (ThunderAgent): Using fully external setup - "
                 f"proxy_url={proxy_url}, server_urls={server_urls}"
             )
+
         elif has_external_proxy and not has_external_servers:
             raise ValueError(
                 "ThunderAgent requires external_server_urls when using external_proxy_url. "
@@ -62,14 +71,16 @@ class ThunderAgentExp(BasePPOExp):
                 "instead of the actual backends. Set external_server_urls to the list of "
                 "backend URLs behind the proxy."
             )
+
         elif has_external_servers and not has_external_proxy:
             server_urls = list(external_server_urls)
             self._inference_router = self._create_thunder_agent_router(server_urls, ie_cfg)
             proxy_url = self._inference_router.start()
             logger.info(
-                "HTTP Inference (ThunderAgent): Created router over external "
+                f"HTTP Inference (ThunderAgent): Created router over external "
                 f"servers - server_urls={server_urls}, proxy_url={proxy_url}"
             )
+
         else:
             cli_args = build_vllm_cli_args(self.cfg)
             self._server_group = ServerGroup(
@@ -84,7 +95,7 @@ class ThunderAgentExp(BasePPOExp):
             self._inference_router = self._create_thunder_agent_router(server_urls, ie_cfg)
             proxy_url = self._inference_router.start()
             logger.info(
-                "HTTP Inference (ThunderAgent): Built servers and router internally - "
+                f"HTTP Inference (ThunderAgent): Built servers and router internally - "
                 f"proxy_url={proxy_url}, server_urls={server_urls}, colocated={is_colocated}"
             )
 
