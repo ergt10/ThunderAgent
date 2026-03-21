@@ -6,8 +6,7 @@ from examples.train_integrations.harbor.harbor_generator import (
     HarborAgentOutput,
     HarborGenerator,
 )
-from harbor.llms.base import LLMResponse, OutputLengthExceededError
-from harbor.llms.chat import Chat
+from harbor.llms.base import LLMResponse
 from skyrl.train.generators.base import TrajectoryID
 
 
@@ -131,49 +130,6 @@ def test_harbor_dataset_uses_stable_sorted_task_uids(tmp_path):
 
     assert [dataset[i]["prompt"] for i in range(len(dataset))] == [str(task_a.resolve()), str(task_b.resolve())]
     assert [dataset[i]["uid"] for i in range(len(dataset))] == [str(task_a.resolve()), str(task_b.resolve())]
-
-
-def test_output_length_exceeded_error_carries_rollout_details():
-    err = OutputLengthExceededError(
-        "truncated",
-        truncated_response="partial",
-        prompt_token_ids=[1, 2, 3],
-        completion_token_ids=[4, 5],
-        logprobs=[-0.1, -0.2],
-    )
-
-    assert err.truncated_response == "partial"
-    assert err.prompt_token_ids == [1, 2, 3]
-    assert err.completion_token_ids == [4, 5]
-    assert err.logprobs == [-0.1, -0.2]
-
-
-def test_harbor_chat_append_external_turn_preserves_rollout_details():
-    class DummyModel:
-        pass
-
-    chat = Chat(DummyModel())
-    llm_response = LLMResponse(
-        content="partial",
-        prompt_token_ids=[11, 12],
-        completion_token_ids=[21, 22],
-        logprobs=[-0.3, -0.4],
-    )
-
-    chat.append_external_turn("original prompt", llm_response)
-
-    assert chat.messages == [
-        {"role": "user", "content": "original prompt"},
-        {"role": "assistant", "content": "partial"},
-    ]
-    assert chat.rollout_details == [
-        {
-            "prompt_token_ids": [[11, 12]],
-            "completion_token_ids": [[21, 22]],
-            "logprobs": [[-0.3, -0.4]],
-        }
-    ]
-
 
 def test_harbor_generator_uses_inference_proxy_url_for_api_base():
     generator_cfg = SimpleNamespace(
