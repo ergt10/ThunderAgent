@@ -334,13 +334,13 @@ def parse_vllm_metrics(metrics_url: str, metrics_text: str) -> PolledVLLMMetrics
         elif metric_name == "vllm:kv_cache_usage_perc":
             # vLLM exposes this gauge as a 0-1 ratio where 1 means 100% usage.
             metrics.kv_cache_usage_pct = float(value) * 100.0
-        elif metric_name == "vllm:prompt_tokens_total":
+        elif metric_name in ("vllm:prompt_tokens_total", "vllm:prompt_tokens"):
             metrics.prompt_tokens_total = int(value)
-        elif metric_name == "vllm:generation_tokens_total":
+        elif metric_name in ("vllm:generation_tokens_total", "vllm:generation_tokens"):
             metrics.generation_tokens_total = int(value)
-        elif metric_name == "vllm:prefix_cache_queries_total":
+        elif metric_name in ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries"):
             metrics.prefix_cache_queries_total = int(value)
-        elif metric_name == "vllm:prefix_cache_hits_total":
+        elif metric_name in ("vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits"):
             metrics.prefix_cache_hits_total = int(value)
         elif metric_name == "vllm:cache_config_info":
             try:
@@ -844,6 +844,9 @@ def main() -> int:
                     fetch_error = f"{type(exc).__name__}: {exc!r}"
                     print(f"Failed to scrape {metrics_url}: {fetch_error}", file=sys.stderr)
 
+                if fetch_error:
+                    continue
+
                 raw_line = json.dumps(
                     {
                         "kind": "polled_metrics",
@@ -870,13 +873,10 @@ def main() -> int:
                         metrics.prefix_cache_hits_total,
                         metrics.prompt_tokens_total,
                         metrics.generation_tokens_total,
-                        fetch_error,
+                        "",
                         raw_line,
                     ],
                 )
-
-                if fetch_error:
-                    continue
 
                 writer.add_scalar(
                     f"monitor/vllm/{source_tag}/kv_cache_usage_pct",

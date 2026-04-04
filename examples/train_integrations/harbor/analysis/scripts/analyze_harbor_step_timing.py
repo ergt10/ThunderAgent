@@ -155,6 +155,7 @@ def summarize_by_step(rows: list[dict], max_steps: int) -> list[dict]:
 
 def plot_step_stacked_bars(summary_rows: list[dict], output_path: Path) -> None:
     if not summary_rows:
+        plot_no_data(output_path, "No agent step timing data")
         return
 
     fig, ax = plt.subplots(figsize=(16, 8), constrained_layout=True)
@@ -195,6 +196,7 @@ def plot_step_stacked_bars(summary_rows: list[dict], output_path: Path) -> None:
 
 def plot_step_heatmap(summary_rows: list[dict], output_path: Path) -> None:
     if not summary_rows:
+        plot_no_data(output_path, "No agent step timing data")
         return
 
     labels = [label for _key, label in TIMING_ORDER] + ["Step total"]
@@ -217,6 +219,22 @@ def plot_step_heatmap(summary_rows: list[dict], output_path: Path) -> None:
         for col_idx, value in enumerate(values):
             ax.text(col_idx, row_idx, f"{value:.1f}", ha="center", va="center", fontsize=8, color="black")
 
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_no_data(output_path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(12, 4), constrained_layout=True)
+    ax.axis("off")
+    ax.text(0.5, 0.6, title, ha="center", va="center", fontsize=18, weight="bold")
+    ax.text(
+        0.5,
+        0.4,
+        "All completed trials in this run recorded zero agent-source steps in trajectory.json.",
+        ha="center",
+        va="center",
+        fontsize=11,
+    )
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 

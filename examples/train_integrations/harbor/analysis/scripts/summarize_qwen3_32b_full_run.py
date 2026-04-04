@@ -36,9 +36,16 @@ def read_tsv(path: Path) -> List[Dict[str, str]]:
 
 
 def write_tsv(path: Path, rows: Iterable[Dict[str, object]], fieldnames: List[str]) -> None:
+    rows = list(rows)
+    extra_fields: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames and key not in extra_fields:
+                extra_fields.append(key)
+    all_fields = list(fieldnames) + extra_fields
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, delimiter="\t", fieldnames=fieldnames)
+        writer = csv.DictWriter(f, delimiter="\t", fieldnames=all_fields)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -244,7 +251,13 @@ def summarize_training_timings(tensorboard_dir: Path, output_dir: Path) -> Dict[
     scalar_tags = accumulator.Tags().get("scalars", [])
     timing_tags = preferred_timing_order([tag for tag in scalar_tags if tag.startswith("timing/")])
     if not timing_tags:
-        raise RuntimeError(f"No timing scalars found in {tensorboard_dir}")
+        return {
+            "train_step_timing": "",
+            "train_step_timing_summary": "",
+            "train_timing_steps": 0,
+            "max_wait_for_rollout_sec": 0.0,
+            "train_timing_missing": str(tensorboard_dir),
+        }
 
     row_by_step: Dict[int, Dict[str, object]] = defaultdict(dict)
     for tag in timing_tags:

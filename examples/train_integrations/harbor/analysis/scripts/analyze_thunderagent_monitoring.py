@@ -47,6 +47,15 @@ def setup_time_axis(ax) -> None:
     ax.grid(axis="y", linestyle="--", alpha=0.35)
 
 
+def safe_int(value) -> int:
+    if pd.isna(value):
+        return 0
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
 def plot_backend_tokens(backend_df: pd.DataFrame, events_df: pd.DataFrame, output_path: Path) -> None:
     if backend_df.empty:
         return
@@ -149,12 +158,12 @@ def write_report(
             lines.append(
                 "- {}: reasoning_tokens_peak={}, acting_tokens_peak={}, active_tokens_peak={}, reasoning_count_peak={}, acting_count_peak={}, paused_count_peak={}".format(
                     backend_label(backend_url),
-                    int(cur["reasoning_program_tokens"].max()),
-                    int(cur["acting_program_tokens"].max()),
-                    int(cur["active_program_tokens"].max()),
-                    int(cur["reasoning_program_count"].max()),
-                    int(cur["acting_program_count"].max()),
-                    int(cur["paused_program_count"].max()),
+                    safe_int(cur["reasoning_program_tokens"].max()),
+                    safe_int(cur["acting_program_tokens"].max()),
+                    safe_int(cur["active_program_tokens"].max()),
+                    safe_int(cur["reasoning_program_count"].max()),
+                    safe_int(cur["acting_program_count"].max()),
+                    safe_int(cur["paused_program_count"].max()),
                 )
             )
         lines.append("")
@@ -165,11 +174,11 @@ def write_report(
             [
                 "## Final Global Program State",
                 "",
-                f"- total_programs={int(last['total_programs'])}",
-                f"- reasoning_programs={int(last['reasoning_programs'])}",
-                f"- acting_programs={int(last['acting_programs'])}",
-                f"- paused_programs={int(last['paused_programs'])}",
-                f"- released_total={int(last['released_total'])}",
+                f"- total_programs={safe_int(last['total_programs'])}",
+                f"- reasoning_programs={safe_int(last['reasoning_programs'])}",
+                f"- acting_programs={safe_int(last['acting_programs'])}",
+                f"- paused_programs={safe_int(last['paused_programs'])}",
+                f"- released_total={safe_int(last['released_total'])}",
                 "",
             ]
         )
@@ -187,11 +196,11 @@ def write_report(
             [
                 "## Final Trial Progress",
                 "",
-                f"- trial_dirs={int(last['trial_dirs'])}",
-                f"- completed_trials_count={int(last['completed_trials_count'])}",
-                f"- result_json_count={int(last['result_json_count'])}",
-                f"- exception_txt_count={int(last['exception_txt_count'])}",
-                f"- trajectory_json_count={int(last['trajectory_json_count'])}",
+                f"- trial_dirs={safe_int(last['trial_dirs'])}",
+                f"- completed_trials_count={safe_int(last['completed_trials_count'])}",
+                f"- result_json_count={safe_int(last['result_json_count'])}",
+                f"- exception_txt_count={safe_int(last['exception_txt_count'])}",
+                f"- trajectory_json_count={safe_int(last['trajectory_json_count'])}",
                 "",
             ]
         )

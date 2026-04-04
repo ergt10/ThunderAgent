@@ -19,7 +19,7 @@ import pandas as pd
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-LAUNCHER_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})")
+LAUNCHER_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[\.,]\d{3})")
 GLOBAL_STEP_RE = re.compile(r"trainer/global_step':\s*(\d+)")
 CANCELLED_AT_RE = re.compile(r"CANCELLED AT (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 PREFIX_CACHE_HIT_RATE_RE = re.compile(r"Prefix cache hit rate:\s*([0-9.]+)%")
@@ -47,7 +47,7 @@ def parse_launcher_ts(line: str, tz: ZoneInfo) -> Optional[pd.Timestamp]:
     match = LAUNCHER_TS_RE.search(line)
     if not match:
         return None
-    return pd.Timestamp(match.group(1)).tz_localize(tz)
+    return pd.Timestamp(match.group(1).replace(",", ".")).tz_localize(tz)
 
 
 def parse_iso_ts(ts: str, tz: ZoneInfo) -> pd.Timestamp:
@@ -55,6 +55,49 @@ def parse_iso_ts(ts: str, tz: ZoneInfo) -> pd.Timestamp:
     if stamp.tzinfo is None:
         stamp = stamp.tz_localize(tz)
     return stamp
+
+
+def parse_tsv_timestamp_bounds(path: Path, tz: ZoneInfo) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    if not path.exists():
+        return None, None
+    try:
+        df = pd.read_csv(path, sep="\t")
+    except Exception:
+        return None, None
+    ts_col = None
+    for candidate in ("event_timestamp", "timestamp"):
+        if candidate in df.columns:
+            ts_col = candidate
+            break
+    if ts_col is None:
+        return None, None
+    series = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+    series = series.dropna()
+    if series.empty:
+        return None, None
+    localized = series.dt.tz_convert(tz)
+    return localized.min(), localized.max()
+
+
+def infer_monitor_window(run_dir: Path, tz: ZoneInfo) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    candidates = [
+        run_dir / "monitoring" / "trial_progress.tsv",
+        run_dir / "rollout" / "monitoring" / "vllm_metrics.tsv",
+        run_dir / "rollout" / "monitoring" / "gpu_summary.tsv",
+        run_dir / "monitoring" / "thunderagent_backend_state.tsv",
+        run_dir / "monitoring" / "thunderagent_program_state.tsv",
+    ]
+    mins: List[pd.Timestamp] = []
+    maxs: List[pd.Timestamp] = []
+    for candidate in candidates:
+        lower, upper = parse_tsv_timestamp_bounds(candidate, tz)
+        if lower is not None:
+            mins.append(lower)
+        if upper is not None:
+            maxs.append(upper)
+    if not mins or not maxs:
+        return None, None
+    return min(mins), max(maxs)
 
 
 def iter_clean_lines(path: Path) -> Iterable[str]:
@@ -503,6 +546,7 @@ def make_timeline_plot(
     tz = phase_rows[0]["start"].tzinfo  # type: ignore[assignment]
     phase_style = {
         "bring_up_and_preflight": {"label": "Bring-up / Preflight", "color": "#7f8c8d", "hatch": None},
+        "observed_run_span": {"label": "Observed Run Span", "color": "#9c755f", "hatch": ".."},
         "wait_for_generation_buffer": {"label": "Wait Buffer", "color": "#4c78a8", "hatch": None},
         "wait_for_generation_buffer_active": {"label": "Wait Buffer (active)", "color": "#4c78a8", "hatch": "////"},
         "run_training": {"label": "Run Training", "color": "#f58518", "hatch": None},
@@ -602,6 +646,7 @@ def make_timeline_plot(
 
     phase_short = {
         "bring_up_and_preflight": "bring-up",
+        "observed_run_span": "observed",
         "wait_for_generation_buffer": "wait",
         "wait_for_generation_buffer_active": "wait*",
         "run_training": "train",
@@ -1036,8 +1081,16 @@ def main() -> None:
     launcher_info = parse_launcher(launcher_path, tz)
     first_ts = launcher_info["first_ts"]
     last_ts = launcher_info["last_ts"]
+    inferred_start, inferred_end = infer_monitor_window(run_dir, tz)
     if first_ts is None or last_ts is None:
-        raise RuntimeError("Failed to parse launcher timestamps")
+        first_ts = first_ts or inferred_start
+        last_ts = last_ts or inferred_end
+    elif not launcher_info["steps"] and inferred_start is not None and inferred_end is not None:
+        if (last_ts - first_ts).total_seconds() < 60:
+            first_ts = min(first_ts, inferred_start)
+            last_ts = max(last_ts, inferred_end)
+    if first_ts is None or last_ts is None:
+        raise RuntimeError("Failed to parse launcher timestamps or monitoring fallback window")
 
     thunder_wait_timeout_times = parse_thunder_wait_timeout_times(thunder_path, tz)
     candidate_end_times = [last_ts]
@@ -1056,6 +1109,17 @@ def main() -> None:
     rollout_num_requests_running = parse_rollout_num_requests_running(rollout_vllm_metrics_path, first_ts, end_time)
     rollout_num_requests_waiting = parse_rollout_num_requests_waiting(rollout_vllm_metrics_path, first_ts, end_time)
     phase_rows = build_phase_rows(launcher_info["steps"], first_ts, end_time)  # type: ignore[arg-type]
+    if not phase_rows:
+        phase_rows = [
+            {
+                "phase": "observed_run_span",
+                "step_index": 0,
+                "start": first_ts,
+                "end": end_time,
+                "duration_s": (end_time - first_ts).total_seconds(),
+                "notes": "inferred from monitoring timestamps",
+            }
+        ]
 
     make_timeline_plot(
         output_dir / "timeline_overview.png",
