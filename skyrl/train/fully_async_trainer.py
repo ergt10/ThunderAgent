@@ -255,6 +255,10 @@ class _AsyncDataloader:
         return list(self._consumed_data_uids)
 
 
+def _resume_starts_new_epoch(global_step: int, num_steps_per_epoch: int, consumed_uid_count: int) -> bool:
+    return global_step > 0 and num_steps_per_epoch > 0 and global_step % num_steps_per_epoch == 0 and consumed_uid_count > 0
+
+
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
     def __init__(self, *args, **kwargs):
@@ -335,7 +339,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         self.global_step + 1
                     )  # +1 due to we haven't incremented yet
                     steps_completed_in_epoch = self.global_step % self.num_steps_per_epoch
-                    if steps_completed_in_epoch == 0 and len(loaded_consumed_data_uids_set) > 0:
+                    resume_starts_new_epoch = _resume_starts_new_epoch(
+                        self.global_step,
+                        self.num_steps_per_epoch,
+                        len(loaded_consumed_data_uids_set),
+                    )
+                    if resume_starts_new_epoch:
                         # When resuming mid-epoch at the boundary, treat modulo 0 as a full epoch.
                         steps_completed_in_epoch = self.num_steps_per_epoch
                     expected_consumed_in_epoch = self.mini_batch_size * steps_completed_in_epoch
@@ -343,6 +352,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         "Unexpected number of consumed data UIDs. Got: "
                         f"{len(loaded_consumed_data_uids_set)} != {expected_consumed_in_epoch}"
                     )
+                    if resume_starts_new_epoch:
+                        logger.info("Resume landed on an epoch boundary; resetting async dataloader for the new epoch")
+                        await self.async_train_dataloader.reset_at_epoch_end()
 
         # Initialize weight sync state
         with Timer("init_weight_sync_state"):
