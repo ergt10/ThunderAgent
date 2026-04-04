@@ -599,8 +599,10 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "DAYTONA_API_KEY",
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
+        "MSWEA_API_KEY",
         # New inference + network topology
         "_SKYRL_USE_NEW_INFERENCE",
+        "SKYRL_INFERENCE_ROUTER_PORT",
         "NCCL_SOCKET_IFNAME",
         "GLOO_SOCKET_IFNAME",
         # Rootless Docker on head-pinned Harbor control plane
@@ -608,6 +610,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "XDG_RUNTIME_DIR",
         "HARBOR_DOCKER_KEEP_IMAGES",
         "HARBOR_DOCKER_DISABLE_PROJECT_NETWORK",
+        "HARBOR_DOCKER_SHARED_NETWORK_NAME",
         "HARBOR_SHARED_UV_CACHE_HOST_DIR",
         "HARBOR_SHARED_UV_CACHE_ENV_DIR",
         "HARBOR_SHARED_MINI_SWE_TOOL_HOST_HOME",
@@ -621,6 +624,7 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "RAY_TMPDIR",
         "UV_CACHE_DIR",
         "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_HOME",
         "TRITON_CACHE_DIR",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",

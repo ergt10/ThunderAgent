@@ -128,6 +128,7 @@ AUTO_START_MONITOR="${AUTO_START_MONITOR:-true}"
 SCRATCH_ROOT="$(resolve_writable_runtime_root "${SCRATCH_ROOT:-/scratch/$USER/skyrl_runtime}")"
 UV_CACHE_DIR="${UV_CACHE_DIR:-$SCRATCH_ROOT/uv-codex}"
 TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$SCRATCH_ROOT/torchinductor}"
+TRITON_HOME="${TRITON_HOME:-$SCRATCH_ROOT/triton-home}"
 TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$SCRATCH_ROOT/triton}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-$SCRATCH_ROOT/xdg-cache}"
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$SCRATCH_ROOT/xdg-config}"
@@ -151,11 +152,12 @@ HF_XET_DIR="${HF_XET_DIR:-$HF_ROOT/xet}"
 PYTHON_BIN="$(resolve_python_bin)"
 HF_BIN="$(resolve_hf_bin)"
 
-mkdir -p "$MODEL_ROOT" "$LOG_DIR" "$SCRATCH_ROOT" "$UV_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$VLLM_CACHE_ROOT" "$VLLM_CONFIG_ROOT" "$HF_HUB_DIR" "$HF_XET_DIR"
+mkdir -p "$MODEL_ROOT" "$LOG_DIR" "$SCRATCH_ROOT" "$UV_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_HOME" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$VLLM_CACHE_ROOT" "$VLLM_CONFIG_ROOT" "$HF_HUB_DIR" "$HF_XET_DIR"
 mkdir -p "$MONITORING_DIR" "$TENSORBOARD_DIR"
 
 export UV_CACHE_DIR
 export TORCHINDUCTOR_CACHE_DIR
+export TRITON_HOME
 export TRITON_CACHE_DIR
 export XDG_CACHE_HOME
 export XDG_CONFIG_HOME
@@ -412,7 +414,13 @@ for idx in "${!SERVER_PORTS[@]}"; do
   source_name="$(server_source_name "$idx")"
   start_server "${SERVER_GPU_GROUPS[$idx]}" "${SERVER_PORTS[$idx]}" "${SERVER_LOG_FILES[$idx]}" "$idx"
   SERVER_PIDS+=("$LAST_STARTED_PID")
-  wait_for_health "http://127.0.0.1:${SERVER_PORTS[$idx]}" "$source_name" "$LAST_STARTED_PID"
+done
+
+# Launch all rollout engines first so model load and compile overlap across the
+# four GPU groups, then gate on health per engine.
+for idx in "${!SERVER_PORTS[@]}"; do
+  source_name="$(server_source_name "$idx")"
+  wait_for_health "http://127.0.0.1:${SERVER_PORTS[$idx]}" "$source_name" "${SERVER_PIDS[$idx]}"
 done
 
 echo "External rollout servers ready:"
