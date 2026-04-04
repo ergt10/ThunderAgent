@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cross-job wrapper for the documented R2EGYM 1-step Harbor + ThunderAgent run.
-# This keeps the existing 6-node wrappers untouched and encodes the deltas needed for:
-# - merged head+rollout on one node, or a dedicated rollout node when provided
-# - 4 trainer nodes across one or more Slurm jobs
-# - Harbor runtime patch application
-# - R2EGYM task.toml docker_image backfill before image pre-pull
-# - 4 external rollout servers with TP=2, matching the 20260318/20260319 runbooks
+# Canonical Harbor benchmark wrapper.
+# Spec summary:
+# - workload: R2EGYM
+# - model family: Qwen3-32B
+# - topology: merged head/rollout plus 4 trainer nodes across one or more Slurm jobs
+# - rollout: 4 external servers, TP=2
+# - runtime: Harbor patches and task docker-image backfill managed here
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
@@ -1714,7 +1714,7 @@ start_rollout_servers() {
       export TENSORBOARD_DIR='$ROLLOUT_LOG_DIR/tensorboard'
       export SCRATCH_ROOT='$ROLLOUT_RUNTIME_SCRATCH_ROOT'
       mkdir -p '$MERGED_TMP_DIR'
-      bash '$SCRIPT_DIR/start_qwen3_32b_external_rollout_servers.sh'"
+      bash '$SCRIPT_DIR/start_harbor_rollout_servers.sh'"
 }
 
 shell_escape() {
@@ -1781,7 +1781,7 @@ run_training_driver_foreground() {
 	      export HARBOR_MINI_SWE_AGENT_GIT_REF='$HARBOR_MINI_SWE_AGENT_GIT_REF'
 	      export HARBOR_MINI_SWE_AGENT_UV_OFFLINE='$HARBOR_MINI_SWE_AGENT_UV_OFFLINE'
 	      export RUN_PREFLIGHT_CHECKS='$RUN_PREFLIGHT_CHECKS'
-	      stdbuf -oL -eL bash '$SCRIPT_DIR/run_codecontest_qwen3_32b_6node_rootless_fully_async.sh' full max_train_tasks='$MAX_TRAIN_TASKS' max_eval_tasks='$MAX_EVAL_TASKS' trainer.eval_interval='$EVAL_INTERVAL_STEPS' $trainer_resume_overrides harbor_trial_config.agent.name=mini-swe-agent harbor_trial_config.agent.kwargs.max_turns='$HARBOR_AGENT_MAX_TURNS' harbor_trial_config.agent.kwargs.llm_kwargs.timeout='$MINI_SWE_MODEL_TIMEOUT_SEC' harbor_trial_config.agent.override_timeout_sec='$AGENT_TIMEOUT_SEC'" \
+	      stdbuf -oL -eL bash '$SCRIPT_DIR/run_harbor_fully_async.sh' full max_train_tasks='$MAX_TRAIN_TASKS' max_eval_tasks='$MAX_EVAL_TASKS' trainer.eval_interval='$EVAL_INTERVAL_STEPS' $trainer_resume_overrides harbor_trial_config.agent.name=mini-swe-agent harbor_trial_config.agent.kwargs.max_turns='$HARBOR_AGENT_MAX_TURNS' harbor_trial_config.agent.kwargs.llm_kwargs.timeout='$MINI_SWE_MODEL_TIMEOUT_SEC' harbor_trial_config.agent.override_timeout_sec='$AGENT_TIMEOUT_SEC'" \
     >"$TRAIN_DRIVER_LOG" 2>&1
   TRAIN_RC=$?
   set -e
@@ -1836,7 +1836,7 @@ start_training_driver_detached() {
 	      export HARBOR_MINI_SWE_AGENT_GIT_REF='$HARBOR_MINI_SWE_AGENT_GIT_REF'
 	      export HARBOR_MINI_SWE_AGENT_UV_OFFLINE='$HARBOR_MINI_SWE_AGENT_UV_OFFLINE'
 	      export RUN_PREFLIGHT_CHECKS='$RUN_PREFLIGHT_CHECKS'
-	      stdbuf -oL -eL bash '$SCRIPT_DIR/run_codecontest_qwen3_32b_6node_rootless_fully_async.sh' full max_train_tasks='$MAX_TRAIN_TASKS' max_eval_tasks='$MAX_EVAL_TASKS' trainer.eval_interval='$EVAL_INTERVAL_STEPS' $trainer_resume_overrides harbor_trial_config.agent.name=mini-swe-agent harbor_trial_config.agent.kwargs.max_turns='$HARBOR_AGENT_MAX_TURNS' harbor_trial_config.agent.kwargs.llm_kwargs.timeout='$MINI_SWE_MODEL_TIMEOUT_SEC' harbor_trial_config.agent.override_timeout_sec='$AGENT_TIMEOUT_SEC'"
+	      stdbuf -oL -eL bash '$SCRIPT_DIR/run_harbor_fully_async.sh' full max_train_tasks='$MAX_TRAIN_TASKS' max_eval_tasks='$MAX_EVAL_TASKS' trainer.eval_interval='$EVAL_INTERVAL_STEPS' $trainer_resume_overrides harbor_trial_config.agent.name=mini-swe-agent harbor_trial_config.agent.kwargs.max_turns='$HARBOR_AGENT_MAX_TURNS' harbor_trial_config.agent.kwargs.llm_kwargs.timeout='$MINI_SWE_MODEL_TIMEOUT_SEC' harbor_trial_config.agent.override_timeout_sec='$AGENT_TIMEOUT_SEC'"
 }
 
 wait_for_training_driver_terminal() {

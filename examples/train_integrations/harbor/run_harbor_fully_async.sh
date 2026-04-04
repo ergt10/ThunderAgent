@@ -2,21 +2,16 @@
 set -euo pipefail
 
 # ============================================================================
-# SkyRL + Harbor + ThunderAgent: CodeContests fully async training for Qwen3-32B
+# Harbor fully-async launcher.
 #
-# Topology:
-#   - 1 CPU head node for Harbor + rootless Docker + Ray head
-#   - 4 GPU trainer nodes (policy/ref colocated)
-#   - 1 GPU rollout node with 2 external TP=4 vLLM backends
-#
-# Assumes:
-#   - Rootless Docker is already running on the current node
-#   - RAY_ADDRESS points to the live Ray head on the Harbor CPU node
-#   - The rollout node is NOT part of the Ray GPU pool
-#   - Cluster-specific IPs are supplied via env vars for each reservation
+# Spec summary:
+#   - model family: Qwen3-32B
+#   - trainer topology: 4 trainer nodes
+#   - rollout: external servers, TP configured by env
+#   - runtime details: Docker mode, paths, and cluster IPs come from env
 #
 # Usage:
-#   bash examples/train_integrations/harbor/run_codecontest_qwen3_32b_6node_rootless_fully_async.sh full
+#   bash examples/train_integrations/harbor/run_harbor_fully_async.sh full
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

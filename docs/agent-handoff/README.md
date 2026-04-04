@@ -2,24 +2,12 @@
 
 Read order:
 
-1. `project.latest.yaml`
-2. the relevant `workstreams/*.run.yaml`
-3. this file
+1. the relevant `workstreams/*.run.yaml`
+2. this file
 
 File ownership:
 
-- `project.latest.yaml`: objective, phase/status, constraints, top-level workstreams, top 3 next actions, evidence
 - `workstreams/*.run.yaml`: one workstream's execution contract
-
-Update `project.latest.yaml` only when these change:
-
-- objective
-- success criteria
-- phase/status
-- top-level workstreams
-- invariants / forbidden actions
-- next actions
-- source of truth
 
 Update `workstreams/*.run.yaml` only when these change:
 
@@ -36,10 +24,6 @@ Do not edit handoff files for a run failure unless the contract changed.
 
 Hard limits:
 
-- `project.latest.yaml`: `summary` is 3-5 lines
-- `project.latest.yaml`: `next_actions` max 3
-- `project.latest.yaml`: high-impact claims need evidence
-- `project.latest.yaml`: facts must be `fact`, `inference`, or `stale`
 - `workstreams/*.run.yaml`: commands must be copyable
 - `workstreams/*.run.yaml`: baseline/treatment delta must be explicit
 - `workstreams/*.run.yaml`: monitoring outputs must be named files
@@ -69,7 +53,6 @@ cd /home/hkang/zthunder_yagent/SkyRL
 python3 - <<'PY'
 import yaml
 paths = [
-    "docs/agent-handoff/project.latest.yaml",
     "docs/agent-handoff/workstreams/harbor-ta-benchmark.run.yaml",
 ]
 for path in paths:
@@ -83,5 +66,5 @@ If references changed:
 
 ```bash
 cd /home/hkang/zthunder_yagent/SkyRL
-rg -n "agent-handoff|project.latest.yaml|run.yaml" docs/agent-handoff
+rg -n "agent-handoff|run.yaml" docs/agent-handoff
 ```

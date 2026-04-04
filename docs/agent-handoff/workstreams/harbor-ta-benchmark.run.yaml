@@ -8,9 +8,8 @@ meta:
   owner: "hkang + agents"
   repo_root: "/home/hkang/zthunder_yagent/SkyRL"
   source_of_truth:
-    execution_wrapper: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_r2egym_qwen3_32b_5node_rootless_full_1step_miniswe50_timeout9000_fd131072_cross_job_merged_head_rollout.sh"
-    ta_runtime_handoff: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/docs/runbooks/R2EGYM_QWEN3_32B_6NODE_1STEP_TA_RUNTIME_FULL_HANDOFF.md"
-    no_ta_reference_wrapper: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_r2egym_qwen3_32b_6node_rootless_full_1step_miniswe50_timeout9000_fd131072_blockdockerd_replay_no_thunderagent_nockpt.sh"
+    execution_wrapper: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_harbor_benchmark.sh"
+    ta_runtime_handoff: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/docs/runbooks/HARBOR_TA_BENCHMARK_HANDOFF.md"
   notes:
     - "Use the custom cross-job wrapper as the execution layer for both baseline and treatment on the current cluster shape."
     - "The intended benchmark delta is whether ThunderAgent is enabled, not a different workload or topology."
@@ -42,7 +41,7 @@ allocation:
 
 shared_env:
   REPO_ROOT: "/home/hkang/zthunder_yagent/SkyRL"
-  WRAPPER: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_r2egym_qwen3_32b_5node_rootless_full_1step_miniswe50_timeout9000_fd131072_cross_job_merged_head_rollout.sh"
+  WRAPPER: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_harbor_benchmark.sh"
   PYTHON_BIN: "/data/zy/models/hkang/run_worktrees/skyrl-r2e-clean-20260321/.venv/bin/python"
   RAY_BIN: "/data/zy/models/hkang/run_worktrees/skyrl-r2e-clean-20260321/.venv/bin/ray"
   MODEL_PATH: "/data/zy/models/$USER/models/Qwen3-32B"
@@ -94,7 +93,7 @@ bootstrap:
     - "export RUN_TS=\"$(date +%Y%m%d_%H%M%S)\""
     - "export RUN_SHORT_ID=\"r2e5m-$(date +%m%d%H%M%S)\""
     - "unset XDG_RUNTIME_DIR DOCKER_HOST DOCKER_PIDFILE DOCKER_EXEC_ROOT PREPULL_XDG_RUNTIME_DIR PREPULL_DOCKER_HOST PREPULL_DOCKER_PIDFILE PREPULL_DOCKER_EXEC_ROOT ROOTLESS_SCRATCH_ROOT TRAIN_RUNTIME_SCRATCH_ROOT ROLLOUT_RUNTIME_SCRATCH_ROOT MERGED_TMP_DIR"
-    - "export WRAPPER=\"$REPO_ROOT/examples/train_integrations/harbor/run_r2egym_qwen3_32b_5node_rootless_full_1step_miniswe50_timeout9000_fd131072_cross_job_merged_head_rollout.sh\""
+    - "export WRAPPER=\"$REPO_ROOT/examples/train_integrations/harbor/run_harbor_benchmark.sh\""
     - "export MERGED_JOB_ID=\"28999\""
     - "export MERGED_NODE=\"research-secure-18\""
     - "export ROLLOUT_JOB_ID=\"28999\""

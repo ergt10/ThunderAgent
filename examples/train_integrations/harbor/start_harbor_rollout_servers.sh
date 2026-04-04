@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Harbor external rollout launcher.
+# Spec summary:
+# - starts the rollout server group used by the canonical benchmark wrapper
+# - rollout port layout and TP are controlled by env
+# - cluster-specific network details stay in env, not in the filename
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 TMP_LOG_ROOT="${TMP_LOG_ROOT:-$(cd "$REPO_ROOT/.." && pwd)/tmp_logs}"

@@ -1,41 +1,20 @@
 ## Harbor Integration
 
-RL training with [Harbor](https://github.com/laude-institute/harbor) as the environment and reward source. See the [full documentation](https://docs.skyrl.ai/docs/harbor) for details.
+Current source of truth for the Harbor benchmark path is:
 
-### Structure
+1. `docs/agent-handoff/README.md`
+2. `docs/agent-handoff/workstreams/harbor-ta-benchmark.run.yaml`
+3. `examples/train_integrations/harbor/run_harbor_benchmark.sh`
 
-```
-examples/train_integrations/harbor/
-  harbor_generator.py              # HarborGenerator: bridges SkyRL <-> Harbor
-  dataset.py                       # HarborTaskDataset: loads task directory paths
-  prepare_harbor_dataset.py        # Downloads + extracts datasets from HuggingFace
-  harbor_trial_config/
-    default.yaml                   # Harbor TrialConfig template
-  entrypoints/
-    main_harbor.py                 # Full training entrypoint
-    main_harbor_generate.py        # Generation-only debug entrypoint
-  run_codecontest.sh               # Code contest training (Qwen3-8B)
-  run_harbor_gen.sh                # Debug generation-only
-```
+The current benchmark contract is the cross-job R2EGYM path. Do not use legacy
+one-off runbooks or old replay wrappers as execution source of truth.
 
-### Quick Start
+Key files that are still part of the active path:
 
-```bash
-cd SkyRL
-
-# 1. Set credentials
-export WANDB_API_KEY=your_wandb_api_key
-# Pick your sandbox provider:
-export DAYTONA_API_KEY=your_daytona_api_key
-# export MODAL_TOKEN_ID=your_modal_token_id
-# export MODAL_TOKEN_SECRET=your_modal_token_secret
-
-# 2. Prepare dataset
-uv run examples/train_integrations/harbor/prepare_harbor_dataset.py \
-    --dataset open-thoughts/CodeContests
-uv run examples/train_integrations/harbor/prepare_harbor_dataset.py \
-    --dataset open-thoughts/OpenThoughts-TB-dev
-
-# 3. Launch training
-bash examples/train_integrations/harbor/run_codecontest.sh
-```
+- `dataset.py`
+- `harbor_generator.py`
+- `run_harbor_fully_async.sh`
+- `start_harbor_rollout_servers.sh`
+- `ops/apply_harbor_runtime_patches.py`
+- `validation/run_harbor_docker_concurrency_smoke.sh`
+- `ops/wait_harbor_driver_until_terminal.py`
