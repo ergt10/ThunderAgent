@@ -38,6 +38,10 @@ SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S = int(
 """
 Timeout for waiting until the inference server is healthy.
 """
+SKYRL_INFERENCE_ROUTER_PORT = int(os.environ.get("SKYRL_INFERENCE_ROUTER_PORT", 8080))
+"""
+Port for the internal HTTP inference router when SkyRL builds one on the driver node.
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime Environment Exports

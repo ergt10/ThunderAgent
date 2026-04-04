@@ -22,7 +22,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 
 from skyrl.backends.skyrl_train.inference_servers.common import get_node_ip
-from skyrl.env_vars import SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S
+from skyrl.env_vars import SKYRL_INFERENCE_ROUTER_PORT, SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class InferenceRouter:
         self,
         server_urls: List[str],
         host: str = "0.0.0.0",
-        port: int = 8080,
+        port: Optional[int] = None,
     ):
         """
         Initialize the router.
@@ -60,18 +60,18 @@ class InferenceRouter:
         Args:
             server_urls: List of backend vLLM server URLs
             host: Host to bind router to
-            port: Port to bind router to
+            port: Port to bind router to. Defaults to `SKYRL_INFERENCE_ROUTER_PORT`.
         """
         self._server_urls = server_urls
         self._host = host
-        self._port = port
+        self._port = SKYRL_INFERENCE_ROUTER_PORT if port is None else port
         self._server_cycle = itertools.cycle(server_urls)
         self._client: Optional[httpx.AsyncClient] = None
         self._app: Optional[FastAPI] = None
         self._server: Optional[uvicorn.Server] = None
         self._server_thread: Optional[threading.Thread] = None
 
-        logger.info(f"InferenceRouter: {len(server_urls)} servers, port={port}")
+        logger.info(f"InferenceRouter: {len(server_urls)} servers, port={self._port}")
 
     def _hash_session_id(self, session_id: str) -> int:
         """Hash session ID to get consistent server index."""

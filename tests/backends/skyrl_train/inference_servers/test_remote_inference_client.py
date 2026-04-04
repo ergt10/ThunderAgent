@@ -487,3 +487,111 @@ class TestRetryOnAbort:
             assert len(result["response_ids"][0]) > 0
         finally:
             await client.teardown()
+
+
+class TestWeightSyncNotifications:
+    """Test weight sync begin/end notifications to proxy."""
+
+    @pytest.fixture
+    def weight_sync_mock_server(self):
+        """Create a mock proxy that supports weight_sync endpoints."""
+        app = FastAPI()
+        state = {"weight_sync_active": False, "begin_calls": 0, "end_calls": 0}
+
+        @app.get("/health")
+        async def health():
+            return {"status": "ok"}
+
+        @app.post("/weight_sync/begin")
+        async def weight_sync_begin():
+            state["weight_sync_active"] = True
+            state["begin_calls"] += 1
+            return {"status": "ok", "weight_sync_active": True}
+
+        @app.post("/weight_sync/end")
+        async def weight_sync_end():
+            state["weight_sync_active"] = False
+            state["end_calls"] += 1
+            return {"status": "ok", "weight_sync_active": False}
+
+        port = get_open_port()
+        config = uvicorn.Config(app=app, host="0.0.0.0", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        for _ in range(100):
+            try:
+                httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.1)
+                break
+            except Exception:
+                time.sleep(0.05)
+
+        yield f"http://127.0.0.1:{port}", state
+
+        server.should_exit = True
+        thread.join(timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_notify_weight_sync_begin(self, weight_sync_mock_server):
+        """notify_weight_sync_begin POSTs to proxy_url."""
+        url, state = weight_sync_mock_server
+        client = RemoteInferenceClient(proxy_url=url, server_urls=[url])
+        try:
+            await client.notify_weight_sync_begin()
+            assert state["begin_calls"] == 1
+            assert state["weight_sync_active"] is True
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_notify_weight_sync_end(self, weight_sync_mock_server):
+        """notify_weight_sync_end POSTs to proxy_url."""
+        url, state = weight_sync_mock_server
+        client = RemoteInferenceClient(proxy_url=url, server_urls=[url])
+        try:
+            await client.notify_weight_sync_begin()
+            await client.notify_weight_sync_end()
+            assert state["end_calls"] == 1
+            assert state["weight_sync_active"] is False
+        finally:
+            await client.teardown()
+
+    @pytest.mark.asyncio
+    async def test_notify_weight_sync_404_is_noop(self, mock_servers):
+        """If proxy returns 404, notification is silently ignored."""
+        # mock_servers don't have /weight_sync endpoints -> catch-all returns 200
+        # but a plain vLLM server would 404. We test with a server that 404s.
+        app = FastAPI()
+
+        @app.get("/health")
+        async def health():
+            return {"status": "ok"}
+
+        # No weight_sync routes -> FastAPI returns 404
+
+        port = get_open_port()
+        config = uvicorn.Config(app=app, host="0.0.0.0", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        for _ in range(100):
+            try:
+                httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.1)
+                break
+            except Exception:
+                time.sleep(0.05)
+
+        client = RemoteInferenceClient(
+            proxy_url=f"http://127.0.0.1:{port}",
+            server_urls=mock_servers["server_urls"],
+        )
+        try:
+            # Should not raise
+            await client.notify_weight_sync_begin()
+            await client.notify_weight_sync_end()
+        finally:
+            await client.teardown()
+            server.should_exit = True
+            thread.join(timeout=1)

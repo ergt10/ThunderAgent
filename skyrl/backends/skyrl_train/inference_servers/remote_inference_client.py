@@ -595,6 +595,50 @@ class RemoteInferenceClient:
         return await self._call_all_servers("/finalize_weight_update", {})
 
     # ---------------------------
+    # Weight Sync Notifications (to proxy/TA)
+    # ---------------------------
+
+    async def notify_weight_sync_begin(self) -> None:
+        """Notify the data-plane proxy that weight sync is beginning.
+
+        If the proxy supports /weight_sync/begin (e.g., ThunderAgent),
+        this causes the proxy to hold new requests and suspend its scheduler.
+        If the proxy doesn't support this endpoint, this is a no-op.
+        """
+        session = await self._get_session()
+        url = f"{self.proxy_url}/weight_sync/begin"
+        try:
+            async with session.post(url, json={}) as resp:
+                if resp.status == 404:
+                    logger.debug("Proxy does not support /weight_sync/begin (404), skipping")
+                    return
+                body = await resp.json() if resp.content_length else None
+                raise_for_status(resp, body)
+                logger.info("Notified proxy: weight sync BEGIN")
+        except aiohttp.ClientConnectionError:
+            logger.debug("Could not reach proxy for weight_sync/begin, skipping")
+
+    async def notify_weight_sync_end(self) -> None:
+        """Notify the data-plane proxy that weight sync has completed.
+
+        If the proxy supports /weight_sync/end (e.g., ThunderAgent),
+        this causes the proxy to release held requests and resume its scheduler.
+        If the proxy doesn't support this endpoint, this is a no-op.
+        """
+        session = await self._get_session()
+        url = f"{self.proxy_url}/weight_sync/end"
+        try:
+            async with session.post(url, json={}) as resp:
+                if resp.status == 404:
+                    logger.debug("Proxy does not support /weight_sync/end (404), skipping")
+                    return
+                body = await resp.json() if resp.content_length else None
+                raise_for_status(resp, body)
+                logger.info("Notified proxy: weight sync END")
+        except aiohttp.ClientConnectionError:
+            logger.debug("Could not reach proxy for weight_sync/end, skipping")
+
+    # ---------------------------
     # Info
     # ---------------------------
 

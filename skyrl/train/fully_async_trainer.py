@@ -412,11 +412,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             [g.uid for g in cur_generation_group_mini_batch]
                         )
 
-                    # 4. After training: pause generation, sync weights, resume.
-                    with Timer("sync_weights", self.all_timings):
-                        await self.inference_engine_client.pause_generation()
-                        await self.async_sync_policy_weights_to_inference_engines()
-                        await self.inference_engine_client.resume_generation()
+                # 4. After training: pause generation, sync weights, resume.
+                with Timer("sync_weights", self.all_timings):
+                    if hasattr(self.inference_engine_client, 'notify_weight_sync_begin'):
+                        await self.inference_engine_client.notify_weight_sync_begin()
+                    await self.inference_engine_client.pause_generation()
+                    await self.async_sync_policy_weights_to_inference_engines()
+                    await self.inference_engine_client.resume_generation()
+                    if hasattr(self.inference_engine_client, 'notify_weight_sync_end'):
+                        await self.inference_engine_client.notify_weight_sync_end()
 
                 # 5. Set logs for this training step.
                 logger.info(status)
