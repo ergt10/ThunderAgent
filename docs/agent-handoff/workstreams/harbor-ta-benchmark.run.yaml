@@ -1,0 +1,533 @@
+version: 1
+kind: "benchmark_run_spec"
+
+meta:
+  name: "harbor-ta-benchmark"
+  objective: "compare_no_ta_vs_ta_1step_wall_clock"
+  primary_metric: "train_step_wall_clock"
+  owner: "hkang + agents"
+  repo_root: "/home/hkang/zthunder_yagent/SkyRL"
+  source_of_truth:
+    execution_wrapper: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_r2egym_qwen3_32b_5node_rootless_full_1step_miniswe50_timeout9000_fd131072_cross_job_merged_head_rollout.sh"
+    ta_runtime_handoff: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/docs/runbooks/R2EGYM_QWEN3_32B_6NODE_1STEP_TA_RUNTIME_FULL_HANDOFF.md"
+    no_ta_reference_wrapper: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_r2egym_qwen3_32b_6node_rootless_full_1step_miniswe50_timeout9000_fd131072_blockdockerd_replay_no_thunderagent_nockpt.sh"
+  notes:
+    - "Use the custom cross-job wrapper as the execution layer for both baseline and treatment on the current cluster shape."
+    - "The intended benchmark delta is whether ThunderAgent is enabled, not a different workload or topology."
+    - "The current canonical benchmark uses system Docker on the merged/head node via DOCKER_MODE=rootful; rootless lifecycle remains wrapper-supported but is not the benchmark default."
+    - "The only allowed Codex launch path is cleanup-stage all -> prepare -> head -> ray -> rollout -> status -> driver."
+    - "The canonical wrapper action bash \"$WRAPPER\" driver is durable: it launches a detached local srun client internally and blocks on explicit terminal-state detection."
+    - "Do not use wrapper action all or driver-detach for benchmark launches."
+    - "Strict path means every executed launch or recovery command must be copied verbatim from bootstrap.commands, variants, stages[*].run, or recovery below."
+    - "Runtime probe skills are disabled for this workstream; use wrapper status and the named logs/TSVs below."
+    - "3-step timing captures must use a dedicated variant that sets FULL_EPOCHS=3 and disables preflight helpers, rather than ad-hoc shell overrides."
+    - "Long-run curated-subset experiments must use a dedicated variant that sets TRAIN_DATA, EVAL_DATA, MAX_TRAIN_TASKS, MAX_EVAL_TASKS, FULL_EPOCHS, and EVAL_INTERVAL_STEPS together."
+
+invariants:
+  - "never_scancel_parent_jobs"
+  - "recover_by_stage_not_full_restart"
+  - "keep_baseline_and_treatment_fair"
+  - "do_not_silently_change_benchmark_contract"
+  - "literal_commands_only_from_run_spec_and_wrapper"
+  - "runtime_probe_skills_disabled_for_ray_rollout_driver"
+
+allocation:
+  current_known_values:
+    MERGED_JOB_ID: "28999"
+    MERGED_NODE: "research-secure-18"
+    ROLLOUT_JOB_ID: "28999"
+    ROLLOUT_NODE: "research-secure-18"
+    TRAINER_NODE_SPECS: "research-secure-26:28911,research-secure-19:28999,research-secure-17:28999,research-secure-08:28982"
+  update_rule: "Replace these values if the current Slurm allocation changes."
+
+shared_env:
+  REPO_ROOT: "/home/hkang/zthunder_yagent/SkyRL"
+  WRAPPER: "/home/hkang/zthunder_yagent/SkyRL/examples/train_integrations/harbor/run_r2egym_qwen3_32b_5node_rootless_full_1step_miniswe50_timeout9000_fd131072_cross_job_merged_head_rollout.sh"
+  PYTHON_BIN: "/data/zy/models/hkang/run_worktrees/skyrl-r2e-clean-20260321/.venv/bin/python"
+  RAY_BIN: "/data/zy/models/hkang/run_worktrees/skyrl-r2e-clean-20260321/.venv/bin/ray"
+  MODEL_PATH: "/data/zy/models/$USER/models/Qwen3-32B"
+  DATA_ROOT: "/home/$USER/zthunder_yagent/data/harbor"
+  TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-trivial','/home/$USER/zthunder_yagent/data/harbor/r2egym-easy','/home/$USER/zthunder_yagent/data/harbor/r2egym-medium','/home/$USER/zthunder_yagent/data/harbor/r2egym-hard']"
+  EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-trivial','/home/$USER/zthunder_yagent/data/harbor/r2egym-easy','/home/$USER/zthunder_yagent/data/harbor/r2egym-medium','/home/$USER/zthunder_yagent/data/harbor/r2egym-hard']"
+  DOCKER_MODE: "rootful"
+  DOCKER_DATA_ROOT: "/scratch/triton_cache/$USER/r2egym-rootless-image-cache"
+  HARBOR_DOCKER_SHARED_NETWORK_NAME: "harbor-r2egym-shared"
+  HARBOR_DOCKER_SHARED_NETWORK_SUBNET: "172.30.0.0/16"
+  RUN_ARTIFACT_ROOT: "/scratch/triton_cache/$USER/harbor_run_artifacts"
+  HARBOR_SHARED_UV_CACHE_HOST_DIR: "/scratch/triton_cache/$USER/harbor-uv-cache"
+  HARBOR_SHARED_MINI_SWE_TOOL_HOST_HOME: "/scratch/triton_cache/$USER/harbor-mini-swe-home"
+  HARBOR_SHARED_UV_PYTHON_HOST_DIR: "/home/$USER/.local/share/uv/python"
+  PREPULL_R2EGYM_IMAGES: "false"
+  DOCKER_INOTIFY_MAX_USER_INSTANCES: "8192"
+  MAX_TRAIN_TASKS: "64"
+  MAX_EVAL_TASKS: "20"
+  AGENT_TIMEOUT_SEC: "9000"
+  MINI_SWE_MODEL_TIMEOUT_SEC: "1200"
+  HARBOR_VERIFIER_TIMEOUT_MAX_ATTEMPTS: "1"
+  HARBOR_HARD_FAILURE_EXCEPTION_TYPES: "RewardFileNotFoundError,VerifierTimeoutError"
+  HARBOR_TASK_CIRCUIT_BREAKER_ENABLED: "1"
+  HARBOR_TASK_CIRCUIT_BREAKER_THRESHOLD: "2"
+  HARBOR_AGENT_MAX_TURNS: "20"
+  ROLLOUT_SERVER_PORTS_CSV: "18000,18001,18002,18003"
+  ROLLOUT_ENGINES: "4"
+  ROLLOUT_TP_SIZE: "2"
+  SKYRL_INFERENCE_ROUTER_PORT: "18080"
+  CKPT_INTERVAL: "-1"
+  HF_SAVE_INTERVAL: "-1"
+  CKPT_ROOT_OVERRIDE: ""
+  EXPORT_ROOT_OVERRIDE: ""
+  TRAINER_RESUME_MODE: "none"
+  TRAINER_RESUME_PATH: ""
+  FULL_EPOCHS: "1"
+  EVAL_INTERVAL_STEPS: "50"
+  RUN_PREFLIGHT_CHECKS: "true"
+  AGENT_RUNTIME_PREFLIGHT: "true"
+  RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "true"
+
+bootstrap:
+  commands:
+    - "cd /home/hkang/zthunder_yagent/SkyRL"
+    - "export REPO_ROOT=\"$PWD\""
+    - "export PYTHON_BIN=\"/data/zy/models/hkang/run_worktrees/skyrl-r2e-clean-20260321/.venv/bin/python\""
+    - "export RAY_BIN=\"/data/zy/models/hkang/run_worktrees/skyrl-r2e-clean-20260321/.venv/bin/ray\""
+    - "export PATH=\"$(dirname \"$PYTHON_BIN\"):$HOME/.local/bin:$PATH\""
+    - "export RUN_TS=\"$(date +%Y%m%d_%H%M%S)\""
+    - "export RUN_SHORT_ID=\"r2e5m-$(date +%m%d%H%M%S)\""
+    - "unset XDG_RUNTIME_DIR DOCKER_HOST DOCKER_PIDFILE DOCKER_EXEC_ROOT PREPULL_XDG_RUNTIME_DIR PREPULL_DOCKER_HOST PREPULL_DOCKER_PIDFILE PREPULL_DOCKER_EXEC_ROOT ROOTLESS_SCRATCH_ROOT TRAIN_RUNTIME_SCRATCH_ROOT ROLLOUT_RUNTIME_SCRATCH_ROOT MERGED_TMP_DIR"
+    - "export WRAPPER=\"$REPO_ROOT/examples/train_integrations/harbor/run_r2egym_qwen3_32b_5node_rootless_full_1step_miniswe50_timeout9000_fd131072_cross_job_merged_head_rollout.sh\""
+    - "export MERGED_JOB_ID=\"28999\""
+    - "export MERGED_NODE=\"research-secure-18\""
+    - "export ROLLOUT_JOB_ID=\"28999\""
+    - "export ROLLOUT_NODE=\"research-secure-18\""
+    - "export TRAINER_NODE_SPECS=\"research-secure-26:28911,research-secure-19:28999,research-secure-17:28999,research-secure-08:28982\""
+    - "export MODEL_PATH=\"/data/zy/models/$USER/models/Qwen3-32B\""
+    - "export DATA_ROOT=\"/home/$USER/zthunder_yagent/data/harbor\""
+    - "export TRAIN_DATA=\"['/home/$USER/zthunder_yagent/data/harbor/r2egym-trivial','/home/$USER/zthunder_yagent/data/harbor/r2egym-easy','/home/$USER/zthunder_yagent/data/harbor/r2egym-medium','/home/$USER/zthunder_yagent/data/harbor/r2egym-hard']\""
+    - "export EVAL_DATA=\"['/home/$USER/zthunder_yagent/data/harbor/r2egym-trivial','/home/$USER/zthunder_yagent/data/harbor/r2egym-easy','/home/$USER/zthunder_yagent/data/harbor/r2egym-medium','/home/$USER/zthunder_yagent/data/harbor/r2egym-hard']\""
+    - "export DOCKER_MODE=rootful"
+    - "export DOCKER_DATA_ROOT=\"/scratch/triton_cache/$USER/r2egym-rootless-image-cache\""
+    - "export HARBOR_DOCKER_SHARED_NETWORK_NAME=\"harbor-r2egym-shared\""
+    - "export HARBOR_DOCKER_SHARED_NETWORK_SUBNET=\"172.30.0.0/16\""
+    - "export RUN_ARTIFACT_ROOT=\"/scratch/triton_cache/$USER/harbor_run_artifacts\""
+    - "export HARBOR_SHARED_UV_CACHE_HOST_DIR=\"/scratch/triton_cache/$USER/harbor-uv-cache\""
+    - "export HARBOR_SHARED_MINI_SWE_TOOL_HOST_HOME=\"/scratch/triton_cache/$USER/harbor-mini-swe-home\""
+    - "export HARBOR_SHARED_UV_PYTHON_HOST_DIR=\"/home/$USER/.local/share/uv/python\""
+    - "export PREPULL_R2EGYM_IMAGES=false"
+    - "export DOCKER_INOTIFY_MAX_USER_INSTANCES=8192"
+    - "export MAX_TRAIN_TASKS=64"
+    - "export MAX_EVAL_TASKS=20"
+    - "export AGENT_TIMEOUT_SEC=9000"
+    - "export MINI_SWE_MODEL_TIMEOUT_SEC=1200"
+    - "export HARBOR_VERIFIER_TIMEOUT_MAX_ATTEMPTS=1"
+    - "export HARBOR_HARD_FAILURE_EXCEPTION_TYPES=\"RewardFileNotFoundError,VerifierTimeoutError\""
+    - "export HARBOR_TASK_CIRCUIT_BREAKER_ENABLED=1"
+    - "export HARBOR_TASK_CIRCUIT_BREAKER_THRESHOLD=2"
+    - "export HARBOR_AGENT_MAX_TURNS=20"
+    - "export ROLLOUT_SERVER_PORTS_CSV=\"18000,18001,18002,18003\""
+    - "export ROLLOUT_ENGINES=4"
+    - "export ROLLOUT_TP_SIZE=2"
+    - "export SKYRL_INFERENCE_ROUTER_PORT=18080"
+    - "export CKPT_INTERVAL=-1"
+    - "export HF_SAVE_INTERVAL=-1"
+    - "export CKPT_ROOT_OVERRIDE=''"
+    - "export EXPORT_ROOT_OVERRIDE=''"
+    - "export TRAINER_RESUME_MODE=none"
+    - "export TRAINER_RESUME_PATH=''"
+    - "export FULL_EPOCHS=1"
+    - "export EVAL_INTERVAL_STEPS=50"
+    - "export RUN_PREFLIGHT_CHECKS=true"
+    - "export AGENT_RUNTIME_PREFLIGHT=true"
+    - "export RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE=true"
+
+variants:
+  baseline:
+    description: "Harbor + SkyRL fully-async baseline without the ThunderAgent gateway."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-1step-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+  baseline_3step_no_preflight:
+    description: "Harbor + SkyRL fully-async baseline, 3 training steps, with timing-clean stages and no preflight helpers."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-3step-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      FULL_EPOCHS: "3"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+  baseline_medium_major_10epoch:
+    description: "Harbor + SkyRL fully-async baseline on the curated medium-major train128/eval32 split for 10 epochs (2 steps per epoch)."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-medium128-10epoch-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train128-medium-major-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval32-medium-major-v1']"
+      MAX_TRAIN_TASKS: "128"
+      MAX_EVAL_TASKS: "32"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "2"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "2"
+  baseline_medium_hard_256_10epoch:
+    description: "Harbor + SkyRL fully-async baseline on the curated medium-hard train256/eval64 split for 10 epochs (4 steps per epoch) with KL loss disabled."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-mediumhard256-10epoch-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "4"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+  baseline_medium_hard_256_10epoch_resume_step16:
+    description: "Resume the interrupted medium-hard train256/eval64 baseline from the saved global_step_16 checkpoint under a fresh run name."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-mediumhard256-10epoch-resume-step16-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "4"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      TRAINER_RESUME_MODE: "from_path"
+      TRAINER_RESUME_PATH: "/data/zy/models/$USER/harbor_ckpts/r2egym-no-ta-mediumhard256-10epoch-20260325_225101/ckpts/global_step_16"
+  baseline_medium_hard_256_10epoch_resume_step16_no_preflight:
+    description: "Resume the interrupted medium-hard train256/eval64 baseline from global_step_16 under a fresh run name, skipping prepare/runtime preflight helpers."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-mediumhard256-10epoch-resume-step16-nopf-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "4"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      TRAINER_RESUME_MODE: "from_path"
+      TRAINER_RESUME_PATH: "/data/zy/models/$USER/harbor_ckpts/r2egym-no-ta-mediumhard256-10epoch-20260325_225101/ckpts/global_step_16"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+  baseline_medium_hard_256_eval_only_step16_no_preflight:
+    description: "Resume the medium-hard train256/eval64 baseline from global_step_16, run the fixed eval at step 16, and exit without further training."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-no-ta-mediumhard256-evalonly-step16-nopf-$(date +%Y%m%d_%H%M%S)"
+      SKYRL_DISABLE_THUNDERAGENT: "1"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "-1"
+      FULL_EPOCHS: "4"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      TRAINER_RESUME_MODE: "from_path"
+      TRAINER_RESUME_PATH: "/data/zy/models/$USER/harbor_ckpts/r2egym-no-ta-mediumhard256-10epoch-20260325_225101/ckpts/global_step_16"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+  thunderagent:
+    description: "Same experiment shape with ThunderAgent enabled."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-ta-1step-$(date +%Y%m%d_%H%M%S)"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+    unset_env:
+      - "SKYRL_DISABLE_THUNDERAGENT"
+  thunderagent_2step_no_preflight:
+    description: "ThunderAgent-enabled counterpart for the interrupted baseline capture: 2 training steps with timing-clean stages and no preflight helpers."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-ta-2step-$(date +%Y%m%d_%H%M%S)"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      FULL_EPOCHS: "2"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+    unset_env:
+      - "SKYRL_DISABLE_THUNDERAGENT"
+  thunderagent_medium_hard_256_10epoch_no_preflight:
+    description: "ThunderAgent-enabled fresh run matching the medium-hard train256/eval64 10-epoch, 4-step-per-epoch KL-disabled baseline shape, skipping preflight helpers."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-ta-mediumhard256-10epoch-nopf-$(date +%Y%m%d_%H%M%S)"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "4"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+    unset_env:
+      - "SKYRL_DISABLE_THUNDERAGENT"
+  thunderagent_medium_hard_256_10epoch_resume_step24_no_preflight:
+    description: "ThunderAgent-enabled resume run continuing the interrupted medium-hard train256/eval64 10-epoch, 4-step-per-epoch KL-disabled run from global_step_24, skipping preflight helpers."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-ta-mediumhard256-10epoch-resume-step24-nopf-$(date +%Y%m%d_%H%M%S)"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "4"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      TRAINER_RESUME_MODE: "from_path"
+      TRAINER_RESUME_PATH: "/data/zy/models/$USER/harbor_ckpts/r2egym-ta-mediumhard256-10epoch-nopf-20260328_081125/ckpts/global_step_24"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+    unset_env:
+      - "SKYRL_DISABLE_THUNDERAGENT"
+  thunderagent_medium_hard_256_10epoch_resume_step16:
+    description: "ThunderAgent-enabled resume run continuing the medium-hard train256/eval64 10-epoch, 4-step-per-epoch KL-disabled run from global_step_16 with the standard canonical preflight helpers."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-ta-mediumhard256-10epoch-resume-step16-$(date +%Y%m%d_%H%M%S)"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "4"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      TRAINER_RESUME_MODE: "from_path"
+      TRAINER_RESUME_PATH: "/data/zy/models/$USER/harbor_ckpts/r2egym-ta-mediumhard256-10epoch-nopf-20260328_081125/ckpts/global_step_16"
+    unset_env:
+      - "SKYRL_DISABLE_THUNDERAGENT"
+  thunderagent_medium_hard_256_eval_only_step40_no_preflight:
+    description: "Resume the ThunderAgent medium-hard train256/eval64 run from global_step_40, run the fixed eval at step 40, and exit without further training."
+    env:
+      RUN_NAME_OVERRIDE: "r2egym-ta-mediumhard256-evalonly-step40-nopf-$(date +%Y%m%d_%H%M%S)"
+      THUNDERAGENT_WATCHDOG_ENABLED: "0"
+      HARBOR_AGENT_MAX_TURNS: "25"
+      TRAIN_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-train256-medium-hard-v1']"
+      EVAL_DATA: "['/home/$USER/zthunder_yagent/data/harbor/r2egym-eval64-medium-hard-v1']"
+      MAX_TRAIN_TASKS: "256"
+      MAX_EVAL_TASKS: "64"
+      CKPT_ROOT_OVERRIDE: "/data/zy/models/$USER/harbor_ckpts"
+      CKPT_INTERVAL: "-1"
+      FULL_EPOCHS: "10"
+      EVAL_INTERVAL_STEPS: "4"
+      USE_KL_LOSS: "false"
+      KL_LOSS_COEF: "0.0"
+      TRAINER_RESUME_MODE: "from_path"
+      TRAINER_RESUME_PATH: "/data/zy/models/$USER/harbor_ckpts/r2egym-ta-mediumhard256-10epoch-resume-step16-20260329_075603/ckpts/global_step_40"
+      RUN_PREFLIGHT_CHECKS: "false"
+      AGENT_RUNTIME_PREFLIGHT: "false"
+      RUN_HARBOR_DOCKER_CONCURRENCY_SMOKE_PREPARE: "false"
+    unset_env:
+      - "SKYRL_DISABLE_THUNDERAGENT"
+
+stages:
+  - id: "prepare"
+    run: "bash \"$WRAPPER\" prepare"
+    runtime_probe_skill: null
+    success_checks:
+      - "command exits 0"
+      - "required Harbor patching and validation complete"
+  - id: "head"
+    run: "bash \"$WRAPPER\" head"
+    runtime_probe_skill: null
+    success_checks:
+      - "command exits 0"
+      - "the selected Docker endpoint is ready on the merged/head node"
+  - id: "ray"
+    run: "bash \"$WRAPPER\" ray"
+    runtime_probe_skill: null
+    first_check_targets:
+      - "bash \"$WRAPPER\" status"
+      - "$LOG_DIR/launcher_ray.log"
+    success_checks:
+      - "command exits 0"
+      - "Ray head and 4 trainer workers are reachable"
+  - id: "rollout"
+    run: "bash \"$WRAPPER\" rollout"
+    runtime_probe_skill: null
+    first_check_targets:
+      - "bash \"$WRAPPER\" status"
+      - "$LOG_DIR/launcher_rollout.log"
+      - "$LOG_DIR/rollout/rollout_*.log"
+    success_checks:
+      - "command exits 0"
+      - "ports 18000, 18001, 18002, 18003 are healthy"
+  - id: "status"
+    run: "bash \"$WRAPPER\" status"
+    runtime_probe_skill: null
+    success_checks:
+      - "stage status is readable before driver launch"
+  - id: "driver"
+    run: "bash \"$WRAPPER\" driver"
+    runtime_probe_skill: null
+    first_check_targets:
+      - "bash \"$WRAPPER\" status"
+      - "$LOG_DIR/launcher_train_driver.log"
+      - "$LOG_DIR/monitoring/trial_progress.tsv"
+    success_checks:
+      - "command exits 0 only after the driver reaches a terminal success state"
+      - "use $LOG_DIR/monitoring/trial_progress.tsv as the progress truth for completed trials"
+
+profiling_monitoring:
+  log_root_template: "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE"
+  run_artifact_root_template: "/scratch/triton_cache/$USER/harbor_run_artifacts/$RUN_NAME_OVERRIDE"
+  analysis_output_dir_template: "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/analysis"
+  summary_output_dir_template: "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/post_run_summary"
+  raw_signal_sources:
+    rollout:
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/rollout/monitoring/vllm_metrics.tsv"
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/rollout/monitoring/gpu_summary.tsv"
+    thunderagent:
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/monitoring/thunderagent_backend_state.tsv"
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/monitoring/thunderagent_program_state.tsv"
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/monitoring/thunderagent_events.tsv"
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/monitoring/trial_progress.tsv"
+    training:
+      - "/scratch/triton_cache/$USER/harbor_run_artifacts/$RUN_NAME_OVERRIDE/memory_events/*.jsonl"
+      - "/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE/monitoring/async_trace.jsonl"
+      - "/scratch/triton_cache/$USER/harbor_run_artifacts/$RUN_NAME_OVERRIDE/trials_run/**/result.json"
+      - "/scratch/triton_cache/$USER/harbor_run_artifacts/$RUN_NAME_OVERRIDE/trials_run/**/agent/trajectory.json"
+  required_post_run_outputs:
+    rollout:
+      - "rollout_prefix_cache_hit_rate.png"
+      - "rollout_num_requests_running.png"
+      - "rollout_num_requests_waiting.png"
+      - "rollout_kv_usage.png"
+      - "rollout_memory.png"
+      - "rollout_kv_cache_summary.tsv"
+    thunderagent:
+      - "thunderagent_backend_tokens.png"
+      - "thunderagent_program_counts.png"
+      - "thunderagent_monitoring_report.md"
+    training:
+      - "trainer_memory.png"
+      - "timeline_overview.png"
+      - "timeline_report.md"
+      - "trial_step_timing_breakdown.png"
+      - "trial_step_timing_heatmap.png"
+      - "trial_step_timing_report.md"
+      - "trial_stage_breakdown.png"
+      - "trial_stage_breakdown_report.md"
+  post_run_analysis:
+    setup:
+      - "export LOG_DIR=\"/home/hkang/zthunder_yagent/tmp_logs/$RUN_NAME_OVERRIDE\""
+      - "export RUN_ARTIFACT_DIR=\"/scratch/triton_cache/$USER/harbor_run_artifacts/$RUN_NAME_OVERRIDE\""
+      - "export ANALYSIS_DIR=\"$LOG_DIR/analysis\""
+      - "export SUMMARY_DIR=\"$LOG_DIR/post_run_summary\""
+      - "mkdir -p \"$ANALYSIS_DIR\" \"$SUMMARY_DIR\""
+    commands:
+      - "\"$REPO_ROOT/.venv/bin/python\" \"$REPO_ROOT/examples/train_integrations/harbor/analysis/scripts/summarize_qwen3_32b_full_run.py\" --run-name \"$RUN_NAME_OVERRIDE\" --log-dir \"$LOG_DIR\" --trainer-monitor-root \"$LOG_DIR/trainer_monitors\" --rollout-monitor-dir \"$LOG_DIR/rollout/monitoring\" --tensorboard-dir \"$LOG_DIR/tensorboard\" --async-trace \"$LOG_DIR/monitoring/async_trace.jsonl\" --output-dir \"$SUMMARY_DIR\" --python-bin \"$REPO_ROOT/.venv/bin/python\""
+      - "\"$REPO_ROOT/.venv/bin/python\" \"$REPO_ROOT/examples/train_integrations/harbor/analysis/scripts/analyze_thunderagent_monitoring.py\" --log-dir \"$LOG_DIR\" --output-dir \"$ANALYSIS_DIR\""
+      - "\"$REPO_ROOT/.venv/bin/python\" \"$REPO_ROOT/examples/train_integrations/harbor/analysis/scripts/analyze_qwen3_full_run_timeline.py\" --run-name \"$RUN_NAME_OVERRIDE\" --log-root \"/home/hkang/zthunder_yagent/tmp_logs\" --output-dir \"$ANALYSIS_DIR\""
+      - "\"$REPO_ROOT/.venv/bin/python\" \"$REPO_ROOT/examples/train_integrations/harbor/analysis/scripts/analyze_harbor_step_timing.py\" --run-dir \"$RUN_ARTIFACT_DIR\" --output-dir \"$ANALYSIS_DIR\" --max-steps 50"
+      - "\"$REPO_ROOT/.venv/bin/python\" \"$REPO_ROOT/examples/train_integrations/harbor/analysis/scripts/analyze_harbor_trial_stage_breakdown.py\" --run-artifacts-dir \"$RUN_ARTIFACT_DIR\" --output-dir \"$ANALYSIS_DIR\""
+    mapping:
+      rollout_kv_cache_hit_rate_per_engine:
+        script: "analyze_qwen3_full_run_timeline.py"
+        outputs:
+          - "rollout_prefix_cache_hit_rate.png"
+          - "timeline_report.md"
+      rollout_num_running_waiting_per_engine:
+        script: "analyze_qwen3_full_run_timeline.py"
+        outputs:
+          - "rollout_num_requests_running.png"
+          - "rollout_num_requests_waiting.png"
+          - "timeline_report.md"
+      thunderagent_metric_timelines:
+        script: "analyze_thunderagent_monitoring.py"
+        outputs:
+          - "thunderagent_backend_tokens.png"
+          - "thunderagent_program_counts.png"
+          - "thunderagent_monitoring_report.md"
+      trainer_memory_timeline:
+        script: "analyze_qwen3_full_run_timeline.py"
+        outputs:
+          - "trainer_memory.png"
+          - "timeline_report.md"
+      training_part_timing:
+        script: "analyze_harbor_step_timing.py"
+        outputs:
+          - "trial_step_timing_breakdown.png"
+          - "trial_step_timing_heatmap.png"
+          - "trial_step_timing_report.md"
+      trial_stage_timing:
+        script: "analyze_harbor_trial_stage_breakdown.py"
+        outputs:
+          - "trial_stage_breakdown.png"
+          - "trial_stage_breakdown_report.md"
+  caveats:
+    - "The current cross-job wrapper does not automatically run the post-run analysis commands above; run them explicitly after each baseline or ThunderAgent capture."
+    - "The current cross-job wrapper does not yet start per-trainer-node gpu_summary collection across multiple job IDs, so trainer node monitor summaries may be missing even though run-level trainer memory timelines from RUN_ARTIFACT_DIR/memory_events should still exist."
+    - "ThunderAgent-specific plots are only expected to be meaningful for the ThunderAgent-enabled treatment."
+    - "When invoking prepare/head/ray/rollout/driver as separate commands, pin RUN_TS and RUN_SHORT_ID once per run and clear inherited XDG_RUNTIME_DIR/DOCKER_* so the wrapper uses one scratch-scoped rootless runtime. Otherwise head can collide with /run/user/$UID/dockerd-rootless and later stages may look at a different Docker socket/path set."
+
+recovery:
+  rollout_only:
+    - "bash \"$WRAPPER\" cleanup-stage rollout"
+    - "bash \"$WRAPPER\" rollout"
+  driver_only:
+    - "bash \"$WRAPPER\" cleanup-stage driver"
+    - "bash \"$WRAPPER\" driver"
+  driver_preflight_only:
+    - "bash \"$WRAPPER\" driver-preflight"
+  full_stack_owned_by_wrapper:
+    - "bash \"$WRAPPER\" cleanup-stage all"
+  forbidden:
+    - "Do not cancel parent Slurm jobs as part of routine recovery."
+    - "Do not use wrapper action all for benchmark launches."
+    - "Do not use wrapper action driver-detach for benchmark launches."
+
+comparison_checklist:
+  - "Both runs used the same allocation shape."
+  - "Both runs used the same model path and dataset specs."
+  - "Both runs used the same MAX_TRAIN_TASKS and timeout settings."
+  - "Both runs reached rollout health on the same port set."
+  - "The only intended semantic difference was SKYRL_DISABLE_THUNDERAGENT."
+  - "The compared timing comes from the same stage of the run."
+
+update_policy:
+  update_when:
+    - "wrapper interface changes"
+    - "required env vars change"
+    - "recovery commands change"
+    - "benchmark-shape settings that affect fairness change"
+  do_not_put_here:
+    - "historical run notes"
+    - "free-form replay diary"

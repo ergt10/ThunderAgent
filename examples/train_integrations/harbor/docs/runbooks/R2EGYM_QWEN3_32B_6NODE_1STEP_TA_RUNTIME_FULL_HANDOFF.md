@@ -134,7 +134,7 @@ The shipped defaults still point at the original cluster:
 
 Keep these unless the new cluster forces a change:
 
-- `DOCKER_MODE=rootless`
+- `DOCKER_MODE=rootful`
 - `DOCKER_INOTIFY_MAX_USER_INSTANCES=8192`
 - `HEAD_DOCKER_READY_TIMEOUT_SEC=300`
 - `AGENT_TIMEOUT_SEC=9000`
@@ -154,9 +154,12 @@ Also preserve:
 
 1. Build the Python environment from `pyproject.toml` and `uv.lock`
 2. Apply Harbor runtime patches
-3. Ensure rootless Docker helpers and compose plugin are available if the new cluster does not already provide them:
-   - `examples/train_integrations/harbor/ops/install_rootless_docker_userland.sh`
-   - `examples/train_integrations/harbor/ops/install_docker_compose_plugin.sh`
+3. Ensure the selected Docker runtime is available on the head node:
+   - current benchmark default: system Docker (`DOCKER_MODE=rootful`)
+   - rootless fallback only if the cluster cannot expose a usable system Docker socket:
+     `examples/train_integrations/harbor/ops/install_rootless_docker_userland.sh`
+   - compose plugin if the cluster image does not already provide it:
+     `examples/train_integrations/harbor/ops/install_docker_compose_plugin.sh`
 4. Prepare external assets:
    - model path
    - Harbor R2EGYM dataset paths
@@ -169,6 +172,15 @@ Also preserve:
    - `examples/train_integrations/harbor/run_r2egym_qwen3_32b_6node_rootless_full_1step_miniswe50_timeout9000_fd131072_blockdockerd_replay.sh`
 
 Do not skip readiness and validation on a new cluster.
+
+For the current cross-job benchmark wrapper, keep the canonical stage order
+`cleanup-stage all -> prepare -> head -> ray -> rollout -> status -> driver`.
+That `driver` action is the durable path: it starts a detached local `srun`
+client internally and then waits on
+`examples/train_integrations/harbor/ops/wait_harbor_driver_until_terminal.py`.
+The current benchmark default is system Docker on the merged/head node
+(`DOCKER_MODE=rootful`), not rootless Docker.
+Do not use `driver-detach` for the benchmark path.
 
 ## 10. What Usually Goes Wrong
 
@@ -196,7 +208,7 @@ TRAINER_NODES_CSV=<trainer-a>,<trainer-b>,<trainer-c>,<trainer-d> \
 TRAIN_DATA="['<r2egym-trivial>','<r2egym-easy>','<r2egym-medium>','<r2egym-hard>']" \
 EVAL_DATA="$TRAIN_DATA" \
 MODEL_PATH=<qwen3-32b-model-dir> \
-DOCKER_DATA_ROOT=<rootless-docker-data-root> \
+DOCKER_MODE=rootful \
 HARBOR_SHARED_UV_CACHE_HOST_DIR=<shared-uv-cache> \
 HARBOR_SHARED_MINI_SWE_TOOL_HOST_HOME=<shared-mini-tool-home> \
 HARBOR_SHARED_UV_PYTHON_HOST_DIR=<shared-uv-python-dir> \
