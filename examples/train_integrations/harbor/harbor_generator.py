@@ -1,5 +1,6 @@
 import asyncio
 import os
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -72,7 +73,10 @@ class HarborGenerator(GeneratorInterface):
             "proxy_url",
             f"http://{ie_cfg.http_endpoint_host}:{ie_cfg.http_endpoint_port}",
         )
-        self._supports_program_release = getattr(inference_engine_client, "proxy_url", None) is not None
+        thunderagent_disabled = os.getenv("SKYRL_DISABLE_THUNDERAGENT", "0") == "1"
+        self._supports_program_release = (
+            getattr(inference_engine_client, "proxy_url", None) is not None and not thunderagent_disabled
+        )
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -123,6 +127,31 @@ class HarborGenerator(GeneratorInterface):
         self._release_max_inflight = max(1, int(os.getenv("THUNDERAGENT_RELEASE_MAX_INFLIGHT", "64")))
         self._release_client: Optional[httpx.AsyncClient] = None
         self._release_semaphore: Optional[asyncio.Semaphore] = None
+        self._hard_verifier_failure_types = {
+            item.strip()
+            for item in os.getenv(
+                "HARBOR_HARD_FAILURE_EXCEPTION_TYPES",
+                "RewardFileNotFoundError,VerifierTimeoutError",
+            ).split(",")
+            if item.strip()
+        }
+        self._task_circuit_breaker_enabled = self._get_bool_env(
+            "HARBOR_TASK_CIRCUIT_BREAKER_ENABLED",
+            True,
+        )
+        self._task_circuit_breaker_threshold = self._get_int_env(
+            "HARBOR_TASK_CIRCUIT_BREAKER_THRESHOLD",
+            2,
+            minimum=1,
+        )
+        self._task_hard_failure_streaks: dict[str, int] = defaultdict(int)
+        self._task_circuit_breaker_open: set[str] = set()
+        logger.info(
+            "HarborGenerator hard failure handling: "
+            f"types={sorted(self._hard_verifier_failure_types)} "
+            f"circuit_breaker_enabled={self._task_circuit_breaker_enabled} "
+            f"threshold={self._task_circuit_breaker_threshold}"
+        )
 
     def _ensure_release_transport(self) -> tuple[httpx.AsyncClient, asyncio.Semaphore]:
         if self._release_client is None:
@@ -136,6 +165,58 @@ class HarborGenerator(GeneratorInterface):
         if self._release_semaphore is None:
             self._release_semaphore = asyncio.Semaphore(self._release_max_inflight)
         return self._release_client, self._release_semaphore
+
+    @staticmethod
+    def _get_bool_env(name: str, default: bool) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _get_int_env(name: str, default: int, minimum: int = 0) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            return max(minimum, int(value))
+        except ValueError:
+            logger.warning(f"Invalid integer for {name}={value!r}; falling back to {default}")
+            return default
+
+    @staticmethod
+    def _task_key(prompt: str) -> str:
+        return str(prompt)
+
+    @staticmethod
+    def _task_label(prompt: str) -> str:
+        prompt_str = str(prompt)
+        return os.path.basename(prompt_str.rstrip("/")) or prompt_str
+
+    def _is_hard_verifier_failure(self, exc_type: Optional[str]) -> bool:
+        return exc_type in self._hard_verifier_failure_types
+
+    def _record_non_hard_outcome(self, task_key: str) -> None:
+        if task_key in self._task_circuit_breaker_open:
+            return
+        self._task_hard_failure_streaks.pop(task_key, None)
+
+    def _record_hard_verifier_failure(self, task_key: str, task_label: str, exc_type: str) -> bool:
+        if not self._task_circuit_breaker_enabled:
+            return False
+
+        self._task_hard_failure_streaks[task_key] += 1
+        failure_count = self._task_hard_failure_streaks[task_key]
+        if failure_count < self._task_circuit_breaker_threshold:
+            return False
+
+        if task_key not in self._task_circuit_breaker_open:
+            self._task_circuit_breaker_open.add(task_key)
+            logger.warning(
+                "Opening Harbor task circuit breaker for "
+                f"{task_label} after {failure_count} consecutive {exc_type} failures"
+            )
+        return True
 
     @staticmethod
     def _should_collect_rollout_details(sampling_params: Optional[Dict[str, Any]]) -> bool:
@@ -528,7 +609,22 @@ class HarborGenerator(GeneratorInterface):
         successful = False
         is_context_length_error = False
         is_agent_timeout_error = False
-        collect_rollout_details = False
+        collect_rollout_details = self._should_collect_rollout_details(sampling_params)
+        task_key = self._task_key(prompt)
+        task_label = self._task_label(prompt)
+        if task_key in self._task_circuit_breaker_open:
+            logger.warning(
+                f"Skipping Harbor trial for {task_label}: task circuit breaker already open"
+            )
+            return HarborAgentOutput(
+                response_ids=[0],
+                reward=0,
+                stop_reason="error",
+                loss_mask=[0],
+                prompt_ids=[0],
+                rollout_logprobs=[0.0] if collect_rollout_details else None,
+                trajectory_id=trajectory_id,
+            )
         for i in range(MAX_NUM_RETRIES_PER_TRIAL):
             prefix = f"Trajectory {trajectory_id} attempt {i+1}/{MAX_NUM_RETRIES_PER_TRIAL}"
             results = None
@@ -551,23 +647,38 @@ class HarborGenerator(GeneratorInterface):
                 exc_type = results.exception_info.exception_type if results.exception_info else None
                 is_context_length_error = exc_type == "ContextLengthExceededError"
                 is_agent_timeout_error = exc_type == "AgentTimeoutError"
+                is_hard_verifier_failure = self._is_hard_verifier_failure(exc_type)
 
                 # --- Determine reward ---
                 if is_agent_timeout_error:
                     # AgentTimeoutError: not successful, no retry, loss-masked
+                    self._record_non_hard_outcome(task_key)
                     logger.debug(f"{prefix} hit AgentTimeoutError (no retry). Results: {results}")
                     break
                 elif is_context_length_error:
                     # ContextLengthExceededError: always train with reward=0.
+                    self._record_non_hard_outcome(task_key)
                     logger.debug(
                         f"{prefix} hit ContextLengthExceededError, will train with reward=0. Results: {results}"
                     )
                     reward = 0
+                elif is_hard_verifier_failure:
+                    breaker_open = self._record_hard_verifier_failure(task_key, task_label, exc_type)
+                    logger.warning(
+                        f"{prefix} hit hard verifier failure {exc_type} (no retry). Results: {results}"
+                    )
+                    if breaker_open:
+                        logger.warning(
+                            f"{prefix} stopping early because task circuit breaker is open for {task_label}"
+                        )
+                    break
                 elif not results.verifier_result:
                     # Does not have a verifier result, so it's not successful, will retry
+                    self._record_non_hard_outcome(task_key)
                     logger.warning(f"{prefix} failed: Exception info: {results.exception_info}. Results: {results}")
                     continue
                 else:
+                    self._record_non_hard_outcome(task_key)
                     reward = results.verifier_result.rewards["reward"]
 
                 # --- Extract chat history and check for success ---
@@ -583,6 +694,7 @@ class HarborGenerator(GeneratorInterface):
                         f"{prefix} failed: Did not return a chat history with a user message. chat_history: {chat_history}\nResults: {results}"
                     )
             except Exception as e:
+                self._record_non_hard_outcome(task_key)
                 logger.warning(f"{prefix} failed: Error running trial: {e}. Results: {results}")
                 continue
             finally:

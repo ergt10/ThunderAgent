@@ -26,6 +26,7 @@ from harbor.models.task.task import Task
 
 def create_smoke_task(task_dir: Path) -> None:
     (task_dir / "environment").mkdir(parents=True, exist_ok=True)
+    (task_dir / "environment" / "workspace").mkdir(parents=True, exist_ok=True)
     (task_dir / "tests").mkdir(parents=True, exist_ok=True)
     (task_dir / "solution").mkdir(parents=True, exist_ok=True)
 
@@ -60,16 +61,26 @@ def create_smoke_task(task_dir: Path) -> None:
         ).strip()
         + "\n"
     )
+    (task_dir / "environment" / "workspace" / "metadata.json").write_text(
+        json.dumps(
+            {
+                "sentinel": "workspace-metadata-visible",
+                "expected_output_json": "{\"status\":\"ok\"}",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     (task_dir / "tests" / "test.sh").write_text(
         textwrap.dedent(
             """#!/usr/bin/env bash
             set -euo pipefail
 
-            if [ -f /solution/renamed.txt ]; then
-              stat -c '%u:%g %n' /solution/renamed.txt > /logs/verifier/uploaded-file.txt
+            if [ -f /workspace/metadata.json ]; then
+              stat -c '%u:%g %n' /workspace/metadata.json > /logs/verifier/workspace-metadata.txt
             fi
 
-            if [ -f /solution.py ]; then
+            if [ -f /workspace/metadata.json ] && grep -q 'workspace-metadata-visible' /workspace/metadata.json; then
               echo 1.0 > /logs/verifier/reward.txt
             else
               echo 0.0 > /logs/verifier/reward.txt
@@ -132,6 +143,10 @@ async def run_trial_smoke(task_dir: Path, output_root: Path) -> dict:
         raise RuntimeError(f"Trial failed: {result.exception_info}")
     if not result.verifier_result or "reward" not in result.verifier_result.rewards:
         raise RuntimeError("Verifier did not write a reward")
+    if result.verifier_result.rewards["reward"] != 1.0:
+        raise RuntimeError(
+            f"Expected verifier reward 1.0 after workspace metadata upload, got {result.verifier_result.rewards['reward']}"
+        )
     return {
         "status": "pass",
         "trial_dir": str(trial.trial_dir),

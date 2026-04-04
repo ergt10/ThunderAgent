@@ -89,6 +89,8 @@ def classify_failure(exception_type: str | None, message: str | None, traceback_
     haystack = "\n".join(part for part in [exception_type or "", message or "", traceback_text or ""]).lower()
     if "all predefined address pools have been fully subnetted" in haystack:
         return "docker_address_pool_exhausted"
+    if "no available ipv4 addresses on this network's address pools" in haystack:
+        return "docker_address_pool_exhausted"
     if "unable to create session key" in haystack or "unable to join session keyring" in haystack:
         return "session_key_disk_quota"
     if "docker compose command failed" in haystack:

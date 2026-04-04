@@ -4,12 +4,16 @@ services:
       HARBOR_SHARED_UV_CACHE_ENV_DIR: ${HARBOR_SHARED_UV_CACHE_ENV_DIR:-/harbor-shared/uv-cache}
       HARBOR_SHARED_MINI_SWE_TOOL_ENV_HOME: ${HARBOR_SHARED_MINI_SWE_TOOL_ENV_HOME:-/tmp/harbor-mini-swe-home}
       HARBOR_SHARED_UV_PYTHON_ENV_DIR: ${HARBOR_SHARED_UV_PYTHON_ENV_DIR:-/tmp/harbor-uv-python}
+      ENV_TASK_WORKSPACE_PATH: ${ENV_TASK_WORKSPACE_PATH:-/harbor-mounted/workspace}
+      ENV_TASK_TESTS_PATH: ${ENV_TASK_TESTS_PATH:-/harbor-mounted/tests}
       HARBOR_MINI_SWE_AGENT_GIT_REF: ${HARBOR_MINI_SWE_AGENT_GIT_REF:-}
       HARBOR_MINI_SWE_AGENT_UV_OFFLINE: ${HARBOR_MINI_SWE_AGENT_UV_OFFLINE:-0}
     volumes:
       - ${HOST_VERIFIER_LOGS_PATH}:${ENV_VERIFIER_LOGS_PATH}
       - ${HOST_AGENT_LOGS_PATH}:${ENV_AGENT_LOGS_PATH}
       - ${HOST_ARTIFACTS_PATH}:${ENV_ARTIFACTS_PATH}
+      - ${HOST_TASK_WORKSPACE_PATH}:${ENV_TASK_WORKSPACE_PATH:-/harbor-mounted/workspace}:ro
+      - ${HOST_TASK_TESTS_PATH}:${ENV_TASK_TESTS_PATH:-/harbor-mounted/tests}:ro
       - ${HARBOR_SHARED_UV_CACHE_HOST_DIR:-/tmp/harbor-shared-uv-cache}:${HARBOR_SHARED_UV_CACHE_ENV_DIR:-/harbor-shared/uv-cache}
       - ${HARBOR_SHARED_MINI_SWE_TOOL_HOST_HOME:-/tmp/harbor-mini-swe-home}:${HARBOR_SHARED_MINI_SWE_TOOL_ENV_HOME:-/tmp/harbor-mini-swe-home}
       - ${HARBOR_SHARED_UV_PYTHON_HOST_DIR:-/tmp/harbor-uv-python}:${HARBOR_SHARED_UV_PYTHON_ENV_DIR:-/tmp/harbor-uv-python}:ro
