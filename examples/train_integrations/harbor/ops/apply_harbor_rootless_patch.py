@@ -7,7 +7,8 @@ import argparse
 import importlib
 from pathlib import Path
 
-PATCH_MARKER = "Equivalent to tar --owner=0 --group=0 --numeric-owner."
+UPLOAD_PATCH_MARKER = "Equivalent to tar --owner=0 --group=0 --numeric-owner."
+CLEANUP_PATCH_MARKER = "Preserve prebuilt image cache across Harbor trial cleanup."
 REMOTE_PATCH_MARKERS = (
     'async def _stream_tar_to_container(',
     '"docker",\n            "compose",',
@@ -171,6 +172,62 @@ PATCHED_UPLOAD_BLOCK = """    @staticmethod
         await self._stream_tar_to_directory(tar_bytes, target_dir)
 """
 
+STOCK_STOP_BLOCK = """    async def stop(self, delete: bool):
+        if self._keep_containers and delete:
+            self.logger.warning(
+                "Both `keep_containers` and `--delete` option are set. "
+                "keep_containers takes precedence."
+            )
+        if self._keep_containers:
+            try:
+                await self._run_docker_compose_command(["stop"])
+            except RuntimeError as e:
+                self.logger.warning(f"Docker compose stop failed: {e}")
+        elif delete:
+            try:
+                await self._run_docker_compose_command(
+                    ["down", "--rmi", "all", "--volumes", "--remove-orphans"]
+                )
+            except RuntimeError as e:
+                self.logger.warning(f"Docker compose down failed: {e}")
+
+            # await self._cleanup_build_cache()
+        else:
+            try:
+                await self._run_docker_compose_command(["down"])
+            except RuntimeError as e:
+                self.logger.warning(f"Docker compose down failed: {e}")
+"""
+
+PATCHED_STOP_BLOCK = """    async def stop(self, delete: bool):
+        if self._keep_containers and delete:
+            self.logger.warning(
+                "Both `keep_containers` and `--delete` option are set. "
+                "keep_containers takes precedence."
+            )
+        if self._keep_containers:
+            try:
+                await self._run_docker_compose_command(["stop"])
+            except RuntimeError as e:
+                self.logger.warning(f"Docker compose stop failed: {e}")
+        elif delete:
+            try:
+                cleanup_command = ["down", "--volumes", "--remove-orphans"]
+                # Preserve prebuilt image cache across Harbor trial cleanup.
+                if not self._use_prebuilt:
+                    cleanup_command[1:1] = ["--rmi", "all"]
+                await self._run_docker_compose_command(cleanup_command)
+            except RuntimeError as e:
+                self.logger.warning(f"Docker compose down failed: {e}")
+
+            # await self._cleanup_build_cache()
+        else:
+            try:
+                await self._run_docker_compose_command(["down"])
+            except RuntimeError as e:
+                self.logger.warning(f"Docker compose down failed: {e}")
+"""
+
 
 def resolve_target(explicit_target: str | None) -> Path:
     if explicit_target:
@@ -179,22 +236,36 @@ def resolve_target(explicit_target: str | None) -> Path:
     return Path(docker_mod.__file__).resolve()
 
 
-def is_patch_present(text: str) -> bool:
-    if PATCH_MARKER in text:
+def has_upload_patch_present(text: str) -> bool:
+    if UPLOAD_PATCH_MARKER in text:
         return True
     return all(marker in text for marker in REMOTE_PATCH_MARKERS)
 
 
-def patch_text(text: str) -> str:
-    if is_patch_present(text):
-        return text
-    if STOCK_IMPORTS not in text:
-        raise RuntimeError("Unexpected Harbor docker.py imports block; aborting patch.")
-    if STOCK_UPLOAD_BLOCK not in text:
-        raise RuntimeError("Unexpected Harbor docker.py upload block; aborting patch.")
+def has_cleanup_patch_present(text: str) -> bool:
+    if CLEANUP_PATCH_MARKER in text:
+        return True
+    return 'cleanup_command = ["down", "--volumes", "--remove-orphans"]' in text
 
-    text = text.replace(STOCK_IMPORTS, PATCHED_IMPORTS, 1)
-    text = text.replace(STOCK_UPLOAD_BLOCK, PATCHED_UPLOAD_BLOCK, 1)
+
+def is_patch_present(text: str) -> bool:
+    return has_upload_patch_present(text) and has_cleanup_patch_present(text)
+
+
+def patch_text(text: str) -> str:
+    if not has_upload_patch_present(text):
+        if STOCK_IMPORTS not in text:
+            raise RuntimeError("Unexpected Harbor docker.py imports block; aborting patch.")
+        if STOCK_UPLOAD_BLOCK not in text:
+            raise RuntimeError("Unexpected Harbor docker.py upload block; aborting patch.")
+        text = text.replace(STOCK_IMPORTS, PATCHED_IMPORTS, 1)
+        text = text.replace(STOCK_UPLOAD_BLOCK, PATCHED_UPLOAD_BLOCK, 1)
+
+    if not has_cleanup_patch_present(text):
+        if STOCK_STOP_BLOCK not in text:
+            raise RuntimeError("Unexpected Harbor docker.py stop block; aborting patch.")
+        text = text.replace(STOCK_STOP_BLOCK, PATCHED_STOP_BLOCK, 1)
+
     return text
 
 
