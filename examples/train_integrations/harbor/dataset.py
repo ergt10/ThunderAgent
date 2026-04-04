@@ -1,3 +1,5 @@
+import json
+
 from loguru import logger
 from typing import List, Optional
 from pathlib import Path
@@ -40,6 +42,35 @@ class HarborTaskDataset:
     def _make_uid(cls, task_path: Path) -> str:
         return str(cls._canonicalize_task_path(task_path))
 
+    def _load_manifest_task_paths(self, manifest_path: Path) -> List[Path]:
+        """Resolve task directories listed in a curated-subset MANIFEST.json."""
+        try:
+            data = json.loads(manifest_path.read_text())
+        except Exception as exc:
+            logger.warning(f"Failed to parse Harbor manifest {manifest_path}: {exc}")
+            return []
+
+        tasks = data.get("tasks")
+        if not isinstance(tasks, dict):
+            logger.warning(f"Harbor manifest missing task mapping: {manifest_path}")
+            return []
+
+        data_root = manifest_path.parent.parent
+        resolved_paths = []
+        for bucket_name, bucket_tasks in tasks.items():
+            if not isinstance(bucket_tasks, list):
+                logger.warning(f"Skipping malformed Harbor manifest bucket {bucket_name} in {manifest_path}")
+                continue
+            for rel_task_path in bucket_tasks:
+                task_path = (data_root / rel_task_path).resolve()
+                if not self._is_valid_task_directory(task_path):
+                    logger.warning(f"Skipping invalid Harbor manifest task path: {task_path}")
+                    continue
+                resolved_paths.append(task_path)
+
+        logger.info(f"Resolved {len(resolved_paths)} Harbor tasks from manifest {manifest_path}")
+        return resolved_paths
+
     def _load_data_files(self) -> List[Path]:
         """Load all data files from direct paths and return list of task paths."""
         task_paths = []
@@ -80,6 +111,15 @@ class HarborTaskDataset:
                     task_paths.append(self._canonicalize_task_path(source_path))
                     seen_uids.add(uid)
                     logger.info("Using main directory as valid task")
+                elif (source_path / "MANIFEST.json").is_file():
+                    manifest_task_dirs = self._load_manifest_task_paths(source_path / "MANIFEST.json")
+                    for task_dir in manifest_task_dirs:
+                        uid = self._make_uid(task_dir)
+                        if uid in seen_uids:
+                            logger.warning(f"Skipping duplicate Harbor task path from manifest: {task_dir}")
+                            continue
+                        task_paths.append(self._canonicalize_task_path(task_dir))
+                        seen_uids.add(uid)
                 else:
                     logger.warning(f"No valid task directories found in {source_path}")
             else:
